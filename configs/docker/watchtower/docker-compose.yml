@@ -1,0 +1,138 @@
+# ──────────────────────────────────────────────────────────────────────
+# Watchtower — Docker Container Update Monitor
+# ──────────────────────────────────────────────────────────────────────
+#
+# ✅ What does Watchtower do?
+#    Watchtower watches your running Docker containers and checks if
+#    newer versions of their images are available on Docker Hub (or
+#    whichever registry you pulled from). When it finds an update, it
+#    can either notify you or automatically pull the new image and
+#    restart the container — we use MONITOR-ONLY mode here.
+#
+# ✅ Why monitor-only instead of auto-update?
+#    Auto-updating sounds convenient, but it's risky:
+#      • A breaking change could take down a service at 4 AM
+#      • You lose control over WHEN updates happen
+#      • Database containers (Postgres, MariaDB, etc.) can corrupt
+#        data if restarted without proper migration steps
+#      • You can't test updates before they go live
+#    Monitor-only lets you DECIDE when to update. Watchtower just
+#    sends you a Discord notification saying "hey, new versions are
+#    available" — you stay in control.
+#
+# ✅ How to manually update a container after getting a notification:
+#      1. cd into the service's docker-compose directory
+#      2. docker compose pull        ← pulls the latest image
+#      3. docker compose up -d       ← recreates the container
+#      4. docker image prune -f      ← cleans up old images
+#
+# ✅ Why pin image versions (e.g. :1.7.1) but still monitor for updates?
+#    Pinning ensures reproducibility — you know exactly what's running.
+#    But you still want to KNOW when security patches or important
+#    updates are released. Watchtower tells you, and you choose when
+#    to bump the version tag in your compose file.
+#
+# ✅ Discord notifications via Slack-compatible webhook:
+#    Discord supports Slack-format webhooks by appending "/slack" to
+#    the webhook URL. Watchtower has built-in Slack notification
+#    support, so we piggyback on that — no extra bots or integrations
+#    needed. Just create a webhook in your Discord server and paste
+#    the URL into the .env file.
+#
+# ──────────────────────────────────────────────────────────────────────
+# BEFORE YOU START
+# ──────────────────────────────────────────────────────────────────────
+#
+#   1. Copy .env.example to .env and fill in your Discord webhook URL
+#        cp .env.example .env
+#
+#   2. Make sure the Docker socket is accessible (it should be by
+#      default on most Linux systems)
+#
+#   3. Start Watchtower:
+#        docker compose up -d
+#
+#   4. Verify it's running:
+#        docker compose logs -f watchtower
+#
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: watchtower
+    restart: unless-stopped
+
+    # ── Security ───────────────────────────────────────────────────
+    # Drop all capabilities to add new privileges — defense in depth
+    security_opt:
+      - no-new-privileges:true
+
+    # ── Environment ────────────────────────────────────────────────
+    environment:
+      # ⚠️  CRITICAL — Monitor only, NEVER auto-update containers
+      # This is the most important setting. Without this, Watchtower
+      # would automatically pull new images and restart containers.
+      - WATCHTOWER_MONITOR_ONLY=true
+
+      # Check for updates every Monday at 4:00 AM
+      # Note: Watchtower uses 6-field cron (with seconds):
+      #   ┌─ second (0)
+      #   │ ┌─ minute (0)
+      #   │ │ ┌─ hour (4)
+      #   │ │ │ ┌─ day of month (*)
+      #   │ │ │ │ ┌─ month (*)
+      #   │ │ │ │ │ ┌─ day of week (1 = Monday)
+      #   │ │ │ │ │ │
+      - WATCHTOWER_SCHEDULE=0 0 4 * * 1
+
+      # Don't remove old images — we do that manually after updating
+      - WATCHTOWER_CLEANUP=false
+
+      # ── Notifications via Discord ───────────────────────────────
+      # Uses Discord's Slack-compatible webhook endpoint
+      # The "/slack" suffix on the URL tells Discord to accept
+      # Slack-formatted payloads — no extra config needed
+      - WATCHTOWER_NOTIFICATIONS=slack
+      - WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL=${DISCORD_WEBHOOK_URL}/slack
+      #
+      # Telegram alternative:
+      # Comment out the two Discord lines above, set WATCHTOWER_NOTIFICATION_URL
+      # in .env, then enable this line:
+      # - WATCHTOWER_NOTIFICATION_URL=${WATCHTOWER_NOTIFICATION_URL}
+
+      # Timezone — so the schedule runs at the right local time
+      - TZ=Europe/Amsterdam
+
+    # ── Volumes ────────────────────────────────────────────────────
+    # Watchtower needs the Docker API to list containers and inspect images.
+    # The :ro flag only protects the socket file mount; it does not make Docker
+    # API calls read-only. Treat this container as highly privileged and keep
+    # monitor-only mode enabled.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    # ── Health Check ───────────────────────────────────────────────
+    # Watchtower ships with a built-in health check command
+    healthcheck:
+      test: ["CMD", "/watchtower", "--health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # ── Logging ────────────────────────────────────────────────────
+    # Rotate logs to prevent them from eating disk space
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # ── Resource Limits ────────────────────────────────────────────
+    # Watchtower is lightweight — these limits are generous
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"

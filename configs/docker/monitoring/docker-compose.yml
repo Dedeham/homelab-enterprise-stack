@@ -1,0 +1,500 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  📊 MONITORING STACK — Docker Compose Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  This docker-compose file defines a complete, production-ready monitoring
+#  stack for your homelab. Monitoring is one of the most important parts of
+#  running a server — it lets you know what's happening at all times, catch
+#  problems before they become outages, and understand resource usage trends.
+#
+#  ── What is "monitoring"? ──────────────────────────────────────────────────
+#
+#  Monitoring means collecting "metrics" (numbers that describe the state of
+#  your systems) over time, visualizing them on dashboards, and automatically
+#  alerting you when something goes wrong.
+#
+#  For example:
+#    • CPU usage on your Proxmox host is at 85% for 15 minutes → alert!
+#    • A Docker container keeps restarting → alert!
+#    • Disk space on your storage is below 20% → warning!
+#
+#  ── What are "metrics"? ────────────────────────────────────────────────────
+#
+#  Metrics are time-series data points. Think of them as measurements taken
+#  at regular intervals. Examples:
+#    • node_cpu_seconds_total — how much CPU time has been used
+#    • node_memory_MemAvailable_bytes — how much RAM is free
+#    • container_memory_usage_bytes — how much RAM a container uses
+#
+#  ── How this stack works together ──────────────────────────────────────────
+#
+#  ✅ Prometheus      — The "brain." Scrapes (collects) metrics from all your
+#                        services every 15 seconds and stores them in a
+#                        time-series database. Also evaluates alert rules.
+#
+#  ✅ Grafana          — The "eyes." Beautiful dashboards that visualize all
+#                        the metrics Prometheus collects. This is what you
+#                        actually look at day-to-day.
+#
+#  ✅ Node Exporter    — Exposes host-level metrics (CPU, RAM, disk, network)
+#                        from the machine running Docker.
+#
+#  ✅ cAdvisor         — Exposes container-level metrics (per-container CPU,
+#                        RAM, network, disk I/O) from Docker itself.
+#
+#  ✅ Alertmanager     — Receives alerts from Prometheus and routes them to
+#                        Discord, email, or other notification channels.
+#
+#  ✅ Scrutiny         — Monitors your hard drive health using S.M.A.R.T. data.
+#                        NOTE: In the Docker VM setup, the Scrutiny web UI runs
+#                        here but the collector needs direct disk access. Since
+#                        disks are passed through to the host OS, use your
+#                        host's built-in S.M.A.R.T. monitoring (Settings → Disks) or
+#                        run the collector container separately on the host.
+#                        Warns you before a disk fails!
+#
+#  ✅ Uptime Kuma      — A beautiful uptime monitor. Pings your services and
+#                        shows a status page so you know what's up or down.
+#
+#  ── BEFORE YOU START ───────────────────────────────────────────────────────
+#
+#  1. Copy .env.example to .env and fill in your values:
+#       cp .env.example .env
+#       nano .env
+#
+#  2. Create the data directories and set ownership:
+#       sudo mkdir -p prometheus/rules grafana/provisioning alertmanager
+#       sudo chown -R 1000:1000 prometheus grafana alertmanager
+#
+#  3. Make sure the "proxy" network exists (created by your Traefik stack):
+#       docker network create proxy
+#
+#  4. Place your Prometheus config, alert rules, and Alertmanager config in
+#     the correct subdirectories (see volume mounts below).
+#
+#  5. Launch the stack:
+#       docker compose up -d
+#
+#  6. Access Grafana at https://monitor.example.com
+#     Access Uptime Kuma at https://status.example.com
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  📈 Prometheus — Metrics Collection & Storage
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Prometheus is the core of the monitoring stack. It "scrapes" (pulls)
+  #  metrics from all your services at regular intervals and stores them in
+  #  its internal time-series database (TSDB).
+  #
+  #  Key concepts:
+  #    • Scraping = Prometheus reaches out to each target's /metrics endpoint
+  #    • TSDB = Time-Series DataBase — optimized for storing timestamped data
+  #    • PromQL = Prometheus Query Language — used to query and aggregate data
+  #    • Retention = How long data is kept (set to 30 days below)
+  #
+  #  Web UI available at: http://<server-ip>:9090 (internal network only)
+  # ─────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true                  # Prevent privilege escalation
+    user: '1000:1000'                            # Run as non-root user
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro   # Main config (read-only)
+      - ./prometheus/rules/:/etc/prometheus/rules/:ro                  # Alert rules (read-only)
+      - prometheus_data:/prometheus                                     # Persistent data storage
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'        # Point to our config
+      - '--storage.tsdb.path=/prometheus'                     # Where to store data
+      - '--storage.tsdb.retention.time=30d'                   # Keep 30 days of metrics
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'                              # Allow config reload via API
+    networks:
+      - monitoring
+      - proxy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  📊 Grafana — Dashboards & Visualization
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Grafana is a powerful dashboarding tool. It connects to Prometheus as a
+  #  "data source" and lets you build beautiful, interactive dashboards.
+  #
+  #  Out of the box, we auto-provision:
+  #    • The Prometheus data source (so it's ready immediately)
+  #    • A dashboard directory (drop JSON files in to auto-import dashboards)
+  #
+  #  Popular community dashboards you should import:
+  #    • Node Exporter Full — ID: 1860
+  #    • Docker Container Monitoring — ID: 893
+  #    • Traefik — ID: 17346
+  #
+  #  To import: Go to grafana.com/grafana/dashboards, find a dashboard,
+  #  download the JSON, and place it in grafana/provisioning/dashboards/json/
+  #
+  #  Accessible at: https://monitor.example.com (via Traefik)
+  # ─────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:11.3.1
+    container_name: grafana
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    user: '1000:1000'
+    environment:
+      GF_SECURITY_ADMIN_USER: admin                  # Default admin username
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD} # Set in .env file — CHANGE THIS!
+      GF_USERS_ALLOW_SIGN_UP: 'false'                # Disable public registration
+      GF_SERVER_DOMAIN: monitor.${DOMAIN}             # Your Grafana domain
+      GF_SERVER_ROOT_URL: https://monitor.${DOMAIN}   # Full URL for links/redirects
+    volumes:
+      - grafana_data:/var/lib/grafana                                  # Persistent data (dashboards, users, etc.)
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro            # Auto-provisioning configs
+    networks:
+      - monitoring                    # Access Prometheus on internal network
+      - proxy                         # Expose to Traefik for external access
+    labels:
+      # ── Traefik Reverse Proxy Configuration ──
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`monitor.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=cloudflare"
+      - "traefik.http.routers.grafana.middlewares=authelia@docker,security-headers@file"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  🖥️  Node Exporter — Host System Metrics
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Node Exporter runs on the Docker host and exposes system-level metrics:
+  #    • CPU usage per core
+  #    • Memory (RAM) usage and availability
+  #    • Disk space and I/O statistics
+  #    • Network traffic (bytes in/out per interface)
+  #    • System load averages
+  #    • Filesystem mount point usage
+  #
+  #  It uses "pid: host" to see the real host's process namespace, and
+  #  mounts /proc, /sys, and / as read-only to read system stats safely.
+  #
+  #  The --collector.filesystem.mount-points-exclude flag filters out virtual
+  #  filesystems (like /proc and /sys) that aren't real disks.
+  # ─────────────────────────────────────────────────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pid: host                                    # Use host PID namespace for accurate process metrics
+    volumes:
+      - /proc:/host/proc:ro                      # Host process info
+      - /sys:/host/sys:ro                        # Host system info
+      - /:/rootfs:ro                             # Host root filesystem (read-only!)
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - monitoring
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  🐳 cAdvisor — Container Metrics
+  # ─────────────────────────────────────────────────────────────────────────
+  #  cAdvisor (Container Advisor) provides per-container resource usage
+  #  metrics. While Node Exporter tells you about the HOST, cAdvisor tells
+  #  you about each individual CONTAINER:
+  #    • Container CPU usage
+  #    • Container memory usage and limits
+  #    • Container network I/O
+  #    • Container disk I/O
+  #    • Container restart counts
+  #
+  #  It needs privileged mode to read container stats from cgroups (the
+  #  Linux kernel feature that Docker uses to limit resources).
+  # ─────────────────────────────────────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true                             # Needed for reading container stats from cgroups
+    volumes:
+      - /:/rootfs:ro                             # Host root filesystem
+      - /var/run:/var/run:ro                     # Docker socket and runtime info
+      - /sys:/sys:ro                             # Kernel/cgroup info
+      - /var/lib/docker/:/var/lib/docker:ro      # Docker data directory
+      - /dev/disk/:/dev/disk:ro                  # Disk device info
+    devices:
+      - /dev/kmsg                                # Kernel message buffer
+    networks:
+      - monitoring
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  🔔 Alertmanager — Alert Routing & Notifications
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Alertmanager receives alerts from Prometheus and decides what to do with
+  #  them. It handles:
+  #    • Grouping — combining related alerts into a single notification
+  #    • Inhibition — suppressing lower-priority alerts when a higher one fires
+  #    • Silencing — temporarily muting alerts during maintenance
+  #    • Routing — sending alerts to the right channel (Discord, email, etc.)
+  #
+  #  Think of it this way:
+  #    Prometheus says "something is wrong" → Alertmanager decides "who to tell"
+  #
+  #  Configuration is in alertmanager/alertmanager.yml
+  # ─────────────────────────────────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro  # Config (read-only)
+      - alertmanager_data:/alertmanager                                        # Persistent silence/notification state
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9093/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  💾 Scrutiny — Hard Drive Health Monitoring (Web UI)
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Scrutiny monitors your hard drives using S.M.A.R.T. (Self-Monitoring,
+  #  Analysis, and Reporting Technology). S.M.A.R.T. is built into every
+  #  modern hard drive and SSD — it tracks internal health indicators like:
+  #    • Reallocated sectors (bad blocks the drive has remapped)
+  #    • Temperature
+  #    • Power-on hours
+  #    • Read/write error rates
+  #
+  #  Scrutiny gives you a web dashboard to view drive health and warns you
+  #  BEFORE a drive fails, so you can replace it and avoid data loss.
+  #
+  #  This container is the web UI + API server.
+  #  The collector (below) runs on the host and sends data to this container.
+  # ─────────────────────────────────────────────────────────────────────────
+  scrutiny:
+    image: ghcr.io/analogj/scrutiny:v0.8.1-web
+    container_name: scrutiny
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - scrutiny_data:/opt/scrutiny/config        # Scrutiny configuration and database
+      - scrutiny_influx:/opt/scrutiny/influxdb     # InfluxDB time-series storage for S.M.A.R.T. data
+    networks:
+      - monitoring
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  💾 Scrutiny Collector — S.M.A.R.T. Data Collection Agent
+  # ─────────────────────────────────────────────────────────────────────────
+  #  This is the "collector" component of Scrutiny. It runs on the Docker
+  #  host, reads S.M.A.R.T. data from physical drives, and sends it to the
+  #  Scrutiny web container's API.
+  #
+  #  Instead of running as fully "privileged" (which gives ALL capabilities),
+  #  we only grant the specific Linux capabilities it needs:
+  #    • SYS_RAWIO — Raw I/O access to read S.M.A.R.T. data from drives
+  #    • SYS_ADMIN — Needed for certain SCSI/NVMe commands
+  # ─────────────────────────────────────────────────────────────────────────
+  scrutiny-collector:
+    image: ghcr.io/analogj/scrutiny:v0.8.1-collector
+    container_name: scrutiny-collector
+    restart: unless-stopped
+    cap_add:
+      - SYS_RAWIO                                # Raw I/O for S.M.A.R.T. access — instead of privileged
+      - SYS_ADMIN                                # Needed for certain disk commands — instead of privileged
+    volumes:
+      - /run/udev:/run/udev:ro                   # Device information from udev
+    environment:
+      COLLECTOR_API_ENDPOINT: http://scrutiny:8080  # Send data to the Scrutiny web container
+    depends_on:
+      - scrutiny                                  # Wait for the web UI to be available
+    networks:
+      - monitoring
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.5'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  🟢 Uptime Kuma — Service Uptime Monitoring & Status Page
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Uptime Kuma is a self-hosted monitoring tool (like a self-hosted
+  #  "StatusPage" or "UptimeRobot"). It continuously pings your services
+  #  and shows:
+  #    • Which services are UP or DOWN
+  #    • Response time history
+  #    • Uptime percentage over time
+  #    • A public status page you can share
+  #
+  #  It can also send notifications via Discord, Telegram, email, and 90+
+  #  other integrations when a service goes down.
+  #
+  #  Accessible at: https://status.example.com (via Traefik)
+  # ─────────────────────────────────────────────────────────────────────────
+  uptime-kuma:
+    image: louislam/uptime-kuma:1.23.15
+    container_name: uptime-kuma
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - uptime_kuma_data:/app/data                # Persistent data (monitors, status pages, etc.)
+    networks:
+      - monitoring
+      - proxy                                     # Expose to Traefik for external access
+    labels:
+      # ── Traefik Reverse Proxy Configuration ──
+      - "traefik.enable=true"
+      - "traefik.http.routers.uptime-kuma.rule=Host(`status.${DOMAIN}`)"
+      - "traefik.http.routers.uptime-kuma.entrypoints=websecure"
+      - "traefik.http.routers.uptime-kuma.tls.certresolver=cloudflare"
+      - "traefik.http.routers.uptime-kuma.middlewares=authelia@docker,security-headers@file"
+      - "traefik.http.services.uptime-kuma.loadbalancer.server.port=3001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3001/api/status-page/heartbeat || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  🌐 Networks
+# ─────────────────────────────────────────────────────────────────────────────
+#  We use two networks to isolate traffic:
+#
+#  ✅ monitoring
+#     Private metrics network for monitoring containers. It is intentionally
+#     not internal-only because Prometheus scrapes LAN targets such as Proxmox
+#     and TrueNAS node exporters.
+#
+#  ✅ proxy (external)
+#     The shared network with Traefik. Only containers that need to be
+#     accessible from the internet (Grafana, Uptime Kuma) are attached to
+#     this network. Traefik picks them up via Docker labels.
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+  monitoring:
+    name: monitoring
+  proxy:
+    external: true                               # Created by the Traefik stack
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  💾 Named Volumes
+# ─────────────────────────────────────────────────────────────────────────────
+#  Docker named volumes persist data across container restarts and updates.
+#  They are stored in /var/lib/docker/volumes/ on the host.
+#
+#  To back up a volume:
+#    docker run --rm -v <volume_name>:/data -v $(pwd):/backup \
+#      alpine tar czf /backup/<volume_name>.tar.gz -C /data .
+#
+#  To see volume disk usage:
+#    docker system df -v
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  prometheus_data:                               # Prometheus time-series database (~30 days of metrics)
+  grafana_data:                                  # Grafana dashboards, users, and settings
+  alertmanager_data:                             # Alertmanager silence and notification state
+  scrutiny_data:                                 # Scrutiny configuration and S.M.A.R.T. database
+  scrutiny_influx:                               # Scrutiny's InfluxDB storage for historical drive data
+  uptime_kuma_data:                              # Uptime Kuma monitors, status pages, and history

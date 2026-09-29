@@ -1,0 +1,85 @@
+# Independent Debrid Stack
+#
+# Purpose:
+# - Run debrid tooling independently from the main ARR/qBittorrent stack.
+# - Give RDTClient its own Gluetun VPN gateway and kill switch.
+# - Keep Radarr/Sonarr/Jellyfin in the main ARR stack; do not duplicate them.
+#
+# Deploy on the Ubuntu Docker VM:
+#   mkdir -p /opt/stacks/debrid-stack
+#   cp docker-compose.yml .env.example /opt/stacks/debrid-stack/
+#   cd /opt/stacks/debrid-stack
+#   cp .env.example .env
+#   nano .env
+#   docker compose config
+#   docker compose up -d
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:${GLUETUN_VERSION}
+    container_name: debrid-gluetun
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TZ=${TZ}
+      - VPN_SERVICE_PROVIDER=private internet access
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=${PIA_USER}
+      - OPENVPN_PASSWORD=${PIA_PASS}
+      - SERVER_REGIONS=${PIA_REGION}
+      - VPN_PORT_FORWARDING=${PIA_PORT_FORWARDING}
+      - VPN_PORT_FORWARDING_PROVIDER=private internet access
+      - VPN_PORT_FORWARDING_USERNAME=${PIA_USER}
+      - VPN_PORT_FORWARDING_PASSWORD=${PIA_PASS}
+      - DNS_UPSTREAM_RESOLVER_TYPE=${DNS_UPSTREAM_RESOLVER_TYPE:-doh}
+      - DNS_UPSTREAM_RESOLVERS=${DNS_UPSTREAM_RESOLVERS:-cloudflare}
+      - DNS_UPSTREAM_IPV6=off
+      - BLOCK_MALICIOUS=on
+      - BLOCK_SURVEILLANCE=off
+      - BLOCK_ADS=off
+    volumes:
+      - ${CONFIG_PATH}/gluetun:/gluetun
+    ports:
+      - "${DOCKER_IP}:6500:6500"
+    networks:
+      - debrid
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --timeout=10 https://ifconfig.me >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  rdt-client:
+    image: rogerfar/rdtclient:${RDTCLIENT_VERSION}
+    container_name: debrid-rdt-client
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/rdt-client:/data/db
+      - ${DATA_PATH}:/data
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  debrid:
+    name: debrid
+    driver: bridge

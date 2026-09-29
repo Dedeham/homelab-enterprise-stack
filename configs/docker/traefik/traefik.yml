@@ -1,0 +1,146 @@
+# Traefik Static Configuration
+#
+# What is this file?
+# ──────────────────
+# This file controls how Traefik itself behaves — its entry points (ports),
+# where it stores SSL certificates, how it discovers your services, and
+# what security settings to enforce. Think of it as the "settings" for
+# the front door of your server.
+#
+# ⚠️  IMPORTANT: You MUST edit two values in this file before deploying:
+#   1. Your email address (for Let's Encrypt certificate registration)
+#   2. Your domain name (for the wildcard certificate)
+#   Both are marked with ← CHANGE THIS below.
+#
+# Unlike docker-compose.yml, this file does NOT support ${VARIABLE} syntax.
+# You must hardcode your actual values here.
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+# "warn" means only problems are logged, not every single request.
+# Change to "debug" temporarily if you're troubleshooting routing issues.
+log:
+  level: WARN
+
+# ── Access Logs ────────────────────────────────────────────────────────────────
+# Records every HTTP request (useful for debugging and security auditing).
+# Rotation settings prevent the log from growing forever and filling your disk.
+accessLog:
+  filePath: "/var/log/traefik/access.log"
+  bufferingSize: 100        # Write to disk in batches of 100 for performance
+  filters:
+    statusCodes:
+      - "400-599"           # Only log errors (saves disk space)
+  fields:
+    headers:
+      defaultMode: drop     # Don't log all headers (privacy)
+      names:
+        User-Agent: keep    # Keep user agent for debugging
+
+# ── Ping endpoint (for health checks) ─────────────────────────────────────────
+# This enables a /ping URL that Docker uses to check if Traefik is alive.
+# It's internal only — not exposed to the internet.
+ping:
+  entryPoint: traefik       # Only accessible on the internal metrics port
+
+# ── Prometheus metrics ───────────────────────────────────────────────────────
+# Prometheus scrapes Traefik on the internal "traefik" entrypoint at :8082.
+metrics:
+  prometheus:
+    entryPoint: traefik
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+
+# ── Traefik Dashboard API ──────────────────────────────────────────────────────
+# The web UI at traefik.example.com — shows all routes and services.
+# insecure: false means it requires authentication (via Authelia middleware).
+api:
+  dashboard: true
+  insecure: false   # Never expose the dashboard without authentication
+
+# ── How Traefik discovers your services ────────────────────────────────────────
+providers:
+  # Docker: Traefik reads labels on your containers automatically.
+  # It connects to the Docker socket proxy (not the raw socket) for safety.
+  docker:
+    endpoint: "tcp://socket-proxy:2375"   # Via socket proxy (not raw Docker socket)
+    exposedByDefault: false               # Don't expose containers unless they opt-in
+                                          # (every service must have traefik.enable=true)
+    network: proxy                        # Only route traffic on the "proxy" network
+
+  # File: Load extra rules from the /dynamic/ folder.
+  # Used for security headers, rate limiting, and other reusable middleware.
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true   # Reload automatically when files change (no restart needed)
+
+# ── Entry points — the ports Traefik listens on ───────────────────────────────
+entryPoints:
+  # Port 80: HTTP — immediately redirect everything to HTTPS
+  # Nobody should ever use plain HTTP. This catches accidental HTTP requests
+  # and sends them to HTTPS automatically.
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true   # 301 redirect — browsers remember this permanently
+
+  # Port 443: HTTPS — all real traffic goes here
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: cloudflare   # Use Let's Encrypt via Cloudflare DNS
+        domains:
+          - main: "example.com"         # ← CHANGE THIS to your actual domain
+            sans:
+              - "*.example.com"         # ← CHANGE THIS — wildcard covers all subdomains
+
+  # Internal entry point for health checks and metrics (not exposed externally)
+  traefik:
+    address: ":8082"
+
+# ── Certificate management ────────────────────────────────────────────────────
+# Let's Encrypt via Cloudflare DNS challenge.
+#
+# How it works:
+#   1. Traefik asks Let's Encrypt for a certificate
+#   2. Let's Encrypt says "prove you own this domain"
+#   3. Traefik creates a temporary DNS record via your Cloudflare API token
+#   4. Let's Encrypt sees the DNS record and issues the certificate
+#   5. Traefik stores the certificate and renews it before expiry (every 60-90 days)
+#
+# This all happens automatically. You set it up once and never touch it again.
+certificatesResolvers:
+  cloudflare:
+    acme:
+      email: your@email.com              # ← CHANGE THIS to your real email (for Let's Encrypt alerts)
+      storage: /acme.json                # Where certs are saved (must be chmod 600)
+      dnsChallenge:
+        provider: cloudflare
+        resolvers:
+          - "1.1.1.1:53"                 # Cloudflare DNS (fast, reliable)
+          - "8.8.8.8:53"                 # Google DNS (fallback)
+
+# ── TLS settings — enforce strong encryption ──────────────────────────────────
+# These settings tell Traefik which encryption algorithms to accept.
+# Old, weak algorithms are rejected to prevent downgrade attacks.
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12            # Never use old TLS 1.0 or 1.1
+                                          # (TLS 1.0/1.1 have known vulnerabilities)
+      sniStrict: true                     # Reject connections without valid SNI
+                                          # (SNI = the hostname in the TLS handshake)
+      cipherSuites:
+        # These are the strongest, most modern encryption algorithms.
+        # Order matters — Traefik prefers the ones listed first.
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256   # Good for mobile devices
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+        - TLS_AES_256_GCM_SHA384
+        - TLS_CHACHA20_POLY1305_SHA256

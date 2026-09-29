@@ -1,0 +1,27 @@
+# ── Private, never published ────────────────────────────────────────────────
+# Personal notes, real IPs, scan results, original snapshot
+private/
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# .env files contain passwords and API keys — NEVER commit these
+**/.env
+!**/.env.example
+
+# SSL certificate storage — contains private keys
+**/acme.json
+**/*.pem
+**/*.key
+**/*.crt
+
+# Authelia secrets
+**/authelia/config/secrets/
+
+# Local overrides
+**/*.local.yml
+**/*.override.yml
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+*.swp

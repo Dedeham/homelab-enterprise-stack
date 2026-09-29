@@ -1,0 +1,256 @@
+# AI Stack — Speech Recognition + Vision Model + Workflow Automation
+#
+# What is this stack?
+# ───────────────────
+# Three self-hosted AI building blocks that run entirely on your own hardware:
+#
+#   🎙️  whisper — Speech-to-text (speaches / faster-whisper)
+#                 OpenAI-compatible API: POST /v1/audio/transcriptions
+#   👁️  vision  — Image understanding (llama.cpp server + multimodal GGUF model)
+#                 OpenAI-compatible API: POST /v1/chat/completions (with image input)
+#   🔁  n8n     — Workflow automation that glues everything together
+#                 e.g. "voice memo in Nextcloud → transcript → summary → notification"
+#
+# No data leaves your server. No API keys for cloud AI providers needed.
+#
+# ⚠️  Hardware expectations (CPU-only, no GPU):
+#   - whisper "small" model:     ~1 GB RAM, roughly real-time on a modern 4-core CPU
+#   - vision  Gemma 3 4B (Q4):   ~4–5 GB RAM, a few seconds per image description
+#   - n8n + Postgres:            ~0.5–1 GB RAM
+#   Large models (e.g. Llama 4 Scout, 70B-class models) need 64+ GB RAM or a GPU.
+#   See docs/services/ai-stack.md for model sizing and GPU variants.
+#
+# Network design:
+#   - n8n is the only service on the `proxy` network (reachable through Traefik).
+#   - whisper and vision are NOT routed publicly. n8n reaches them by container
+#     name on `ai_backend`. Optional LAN-only Traefik routes are included below.
+#   - Postgres sits on `ai_db` (internal: true) — no internet, only n8n can reach it.
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./ai-stack dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env:         cd /opt/docker/ai-stack && cp .env.example .env && nano .env
+#   3. Generate secrets:    openssl rand -hex 32   (for N8N_ENCRYPTION_KEY and POSTGRES_PASSWORD)
+#   4. Start:               docker compose up -d
+#   5. Download the Whisper model (one time, see the whisper service below)
+#   6. Watch the vision model download on first start:  docker compose logs -f vision
+#   7. Open n8n at https://n8n.example.com and create the owner account
+
+services:
+
+  # ── Speech Recognition (Whisper) ──────────────────────────────────────────
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
+    container_name: ai-whisper
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Models are downloaded once via the API after the first start:
+      #   docker exec ai-whisper sh -c \
+      #     'curl -fX POST -H "Authorization: Bearer $API_KEY" http://localhost:8000/v1/models/$WHISPER_MODEL'
+      # Sizes: tiny < base < small < medium < large-v3 (bigger = better + slower)
+      WHISPER_MODEL: ${WHISPER_MODEL}       # Only used by the download command above
+      API_KEY: ${WHISPER_API_KEY}           # Clients must send "Authorization: Bearer <key>"
+      LOG_LEVEL: info
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__COMPUTE_TYPE: int8          # int8 = fastest on CPU with minimal quality loss
+    volumes:
+      - whisper_models:/home/ubuntu/.cache/huggingface/hub
+    networks:
+      - ai_backend
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      # LAN/Tailscale only — useful for testing with curl or the built-in web UI
+      - "traefik.http.routers.whisper.rule=Host(`whisper.${DOMAIN}`)"
+      - "traefik.http.routers.whisper.entrypoints=websecure"
+      - "traefik.http.routers.whisper.tls.certresolver=cloudflare"
+      - "traefik.http.routers.whisper.middlewares=admin-whitelist@file,security-headers@file"
+      - "traefik.http.services.whisper.loadbalancer.server.port=8000"
+    healthcheck:
+      # $$ = literal $ for the container shell (not interpolated by compose); /health needs the key
+      test: ["CMD-SHELL", "curl -f -H \"Authorization: Bearer $$API_KEY\" http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: ${WHISPER_MEMORY_LIMIT:-3G}
+          cpus: '${WHISPER_CPUS:-2.0}'
+
+  # ── Vision Model (llama.cpp server, multimodal) ───────────────────────────
+  vision:
+    image: ghcr.io/ggml-org/llama.cpp:server-b11243
+    container_name: ai-vision
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # llama.cpp reads every LLAMA_ARG_* variable as a command-line flag.
+      # LLAMA_ARG_HF_REPO downloads the GGUF model AND its vision projector
+      # (mmproj) from Hugging Face automatically on first start.
+      LLAMA_ARG_HF_REPO: ${VISION_HF_REPO}
+      LLAMA_CACHE: /models
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: 8080
+      LLAMA_ARG_CTX_SIZE: ${VISION_CTX_SIZE:-8192}
+      LLAMA_ARG_THREADS: ${VISION_THREADS:-4}
+      LLAMA_ARG_N_PARALLEL: 1              # One request at a time — keeps RAM predictable
+      LLAMA_ARG_API_KEY: ${VISION_API_KEY}  # Clients must send "Authorization: Bearer <key>"
+    volumes:
+      - vision_models:/models
+    networks:
+      - ai_backend
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      # LAN/Tailscale only — llama.cpp ships a small chat web UI for testing
+      - "traefik.http.routers.vision.rule=Host(`vision.${DOMAIN}`)"
+      - "traefik.http.routers.vision.entrypoints=websecure"
+      - "traefik.http.routers.vision.tls.certresolver=cloudflare"
+      - "traefik.http.routers.vision.middlewares=admin-whitelist@file,security-headers@file"
+      - "traefik.http.services.vision.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s                   # First start downloads several GB
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: ${VISION_MEMORY_LIMIT:-8G}
+          cpus: '${VISION_CPUS:-4.0}'
+
+  # ── n8n Database ──────────────────────────────────────────────────────────
+  n8n-db:
+    image: postgres:16.15-alpine
+    container_name: ai-n8n-db
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - /mnt/main/appdata/ai-stack/postgres:/var/lib/postgresql/data
+    networks:
+      - ai_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ── n8n Workflow Automation ───────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:2.41.3
+    container_name: ai-n8n
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      n8n-db:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-db
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # Encrypts credentials stored in n8n. Losing this key = losing all saved credentials.
+      # Back it up in your password manager.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      N8N_HOST: n8n.${DOMAIN}
+      N8N_PROTOCOL: https
+      N8N_PORT: 5678
+      WEBHOOK_URL: https://n8n.${DOMAIN}/
+      GENERIC_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+      N8N_DIAGNOSTICS_ENABLED: "false"     # No telemetry
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+
+      # Internal endpoints for workflows (use these in HTTP Request nodes)
+      WHISPER_URL: http://ai-whisper:8000
+      VISION_URL: http://ai-vision:8080
+    volumes:
+      - /mnt/main/appdata/ai-stack/n8n:/home/node/.n8n
+    networks:
+      - proxy
+      - ai_backend
+      - ai_db
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      # Editor UI — LAN/Tailscale only. n8n has its own login (owner account + optional 2FA).
+      - "traefik.http.routers.n8n.rule=Host(`n8n.${DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=cloudflare"
+      - "traefik.http.routers.n8n.middlewares=admin-whitelist@file,security-headers@file,rate-limit@file"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+      # Optional: expose ONLY production webhooks publicly (e.g. for external triggers).
+      # Uncomment when needed — the editor stays LAN-only.
+      # - "traefik.http.routers.n8n-webhook.rule=Host(`n8n.${DOMAIN}`) && PathPrefix(`/webhook/`)"
+      # - "traefik.http.routers.n8n-webhook.entrypoints=websecure"
+      # - "traefik.http.routers.n8n-webhook.tls.certresolver=cloudflare"
+      # - "traefik.http.routers.n8n-webhook.middlewares=security-headers@file,rate-limit@file"
+      # - "traefik.http.routers.n8n-webhook.priority=20"
+      # - "traefik.http.routers.n8n-webhook.service=n8n"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+
+networks:
+  proxy:
+    external: true   # Defined in Traefik's compose file
+  ai_backend:
+    # Not internal: whisper and vision need internet access once to download models.
+    # After models are cached you may set `internal: true` to cut all egress.
+    driver: bridge
+  ai_db:
+    internal: true   # Postgres has no internet access — only n8n can reach it
+
+volumes:
+  whisper_models:    # Hugging Face cache for Whisper models (~0.5–3 GB)
+  vision_models:     # GGUF model + mmproj (~3–5 GB for a 4B model)

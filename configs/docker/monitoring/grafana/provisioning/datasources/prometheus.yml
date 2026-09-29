@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  📊 GRAFANA — Auto-Provisioned Data Sources
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  This file tells Grafana to automatically configure Prometheus as a data
+#  source when it starts up. Without this, you'd have to manually add the
+#  data source through the Grafana web UI every time you recreate the
+#  container — this file automates that.
+#
+#  ── What is "provisioning"? ────────────────────────────────────────────────
+#
+#  Provisioning means "automatically configuring something from a file."
+#  Instead of clicking through the Grafana UI to add data sources, you
+#  define them in YAML files and Grafana loads them on startup.
+#
+#  This is an "Infrastructure as Code" approach — your entire Grafana
+#  configuration is version-controlled and reproducible.
+#
+#  ── What is a "data source"? ───────────────────────────────────────────────
+#
+#  A data source is where Grafana gets its data from. Grafana doesn't store
+#  metrics itself — it queries external databases like Prometheus, InfluxDB,
+#  MySQL, etc. When you build a dashboard panel, you choose which data
+#  source to query.
+#
+#  In our setup, Prometheus is the only data source. It's where all our
+#  metrics are stored.
+#
+#  ── How the connection works ───────────────────────────────────────────────
+#
+#  Grafana connects to Prometheus using the Docker network:
+#    • Both are on the "monitoring" network
+#    • Grafana uses the container name "prometheus" as the hostname
+#    • Prometheus listens on port 9090
+#    • So the URL is: http://prometheus:9090
+#
+#  The "proxy" access mode means Grafana's backend makes the requests to
+#  Prometheus (as opposed to "direct" mode where the browser would connect
+#  directly — which wouldn't work since Prometheus isn't exposed publicly).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus               # Display name shown in the Grafana UI
+    type: prometheus                # Data source type (Grafana's built-in Prometheus plugin)
+    access: proxy                   # "proxy" = Grafana backend queries Prometheus (recommended)
+    url: http://prometheus:9090     # Prometheus is on the same Docker network
+    isDefault: true                 # Make this the default data source for new panels
+    editable: false                 # Prevent accidental changes via the UI (managed by this file)

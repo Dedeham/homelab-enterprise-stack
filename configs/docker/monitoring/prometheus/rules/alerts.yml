@@ -1,0 +1,230 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  🔔 PROMETHEUS — Alert Rules
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Alert rules define CONDITIONS that Prometheus checks continuously. When a
+#  condition is true for a specified duration, Prometheus fires an alert and
+#  sends it to Alertmanager, which then notifies you via Discord/email.
+#
+#  ── How alert rules work ───────────────────────────────────────────────────
+#
+#  Each rule has:
+#    • alert: — A human-readable name for the alert
+#    • expr:  — A PromQL expression that evaluates to true/false
+#    • for:   — How long the condition must be true before firing
+#              (prevents alerts from flapping on/off due to brief spikes)
+#    • labels: — Metadata attached to the alert (like severity)
+#    • annotations: — Human-readable descriptions shown in notifications
+#
+#  ── PromQL basics (just enough to understand these rules) ──────────────────
+#
+#  PromQL is Prometheus's query language. Here are the key concepts:
+#
+#  ✅ Metric names — Like variables. Example: node_memory_MemAvailable_bytes
+#     This is the raw value of available memory in bytes.
+#
+#  ✅ Labels — Filters in curly braces. Example: {instance="proxmox"}
+#     This narrows the query to only the Proxmox host.
+#
+#  ✅ Math operators — Standard math: +, -, *, /
+#     Example: (used / total) * 100 = percentage used
+#
+#  ✅ rate() — Calculates per-second rate of change over a time window.
+#     Example: rate(node_cpu_seconds_total[5m]) = CPU usage rate over 5 min
+#
+#  ✅ avg by() — Averages values grouped by a label.
+#     Example: avg by(instance) = one value per machine instead of per CPU core
+#
+#  ✅ increase() — Total increase of a counter over a time window.
+#     Example: increase(container_restart_count[5m]) = restarts in last 5 min
+#
+#  ── Severity levels ────────────────────────────────────────────────────────
+#
+#  We use two severity levels:
+#    • warning  — Something needs attention but isn't urgent. Sent to Discord.
+#    • critical — Immediate action required. Sent to Discord AND email.
+#
+#  ── BEFORE YOU START ───────────────────────────────────────────────────────
+#
+#  ✅ These rules work with the default scrape config in prometheus.yml
+#  ✅ Adjust thresholds to match your environment (e.g., if 85% CPU is
+#     normal for your workload, raise the threshold)
+#  ✅ After editing, reload Prometheus config:
+#       curl -X POST http://localhost:9090/-/reload
+#     (or restart the Prometheus container)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+groups:
+  - name: homelab_alerts
+    rules:
+
+      # ── Disk Space Warning ────────────────────────────────────────────────
+      # Fires when any filesystem has LESS THAN 20% free space.
+      #
+      # How the PromQL works:
+      #   node_filesystem_avail_bytes = bytes available on the filesystem
+      #   node_filesystem_size_bytes  = total size of the filesystem
+      #   (avail / total) * 100       = percentage of free space
+      #   < 20                        = trigger when below 20%
+      #
+      # The filters exclude:
+      #   fstype!~"tmpfs|overlay" — ignore temporary/container filesystems
+      #   mountpoint!~"/boot.*"  — ignore small boot partitions
+      #
+      # "for: 5m" means the disk must be below 20% for 5 continuous minutes
+      # before the alert fires. This prevents false alarms from brief spikes.
+      - alert: DiskSpaceWarning
+        expr: >
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay", mountpoint!~"/boot.*"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay", mountpoint!~"/boot.*"}
+          ) * 100 < 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ Disk space low on {{ $labels.instance }}"
+          description: >
+            Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }}
+            has only {{ printf "%.1f" $value }}% free space remaining.
+            Consider cleaning up old files, logs, or expanding the volume.
+
+      # ── Disk Space Critical ───────────────────────────────────────────────
+      # Same as above but fires at 10% — this is URGENT.
+      # At this point, services may start failing due to no disk space.
+      #
+      # "for: 2m" — shorter wait because this is critical.
+      - alert: DiskSpaceCritical
+        expr: >
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay", mountpoint!~"/boot.*"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay", mountpoint!~"/boot.*"}
+          ) * 100 < 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🚨 Disk space critically low on {{ $labels.instance }}"
+          description: >
+            Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }}
+            has only {{ printf "%.1f" $value }}% free space remaining!
+            IMMEDIATE ACTION REQUIRED — services may crash if disk fills up.
+
+      # ── High Memory Usage ─────────────────────────────────────────────────
+      # Fires when a machine is using MORE THAN 90% of its RAM for 10 min.
+      #
+      # How the PromQL works:
+      #   node_memory_MemAvailable_bytes = RAM available (free + cached + buffers)
+      #   node_memory_MemTotal_bytes     = total installed RAM
+      #   1 - (available / total)        = fraction of RAM USED
+      #   * 100                          = convert to percentage
+      #   > 90                           = trigger above 90%
+      #
+      # Note: Linux uses "available" memory, not "free" memory. Available
+      # includes memory that can be reclaimed from caches, which is more
+      # accurate than just looking at "free" RAM.
+      #
+      # "for: 10m" — wait 10 minutes because memory spikes during backups,
+      # updates, etc. are normal and usually resolve themselves.
+      - alert: HighMemoryUsage
+        expr: >
+          (
+            1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+          ) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ High memory usage on {{ $labels.instance }}"
+          description: >
+            {{ $labels.instance }} is using {{ printf "%.1f" $value }}% of
+            its RAM for the last 10 minutes. Check for memory leaks or
+            consider adding more RAM.
+
+      # ── High CPU Usage ────────────────────────────────────────────────────
+      # Fires when average CPU usage is ABOVE 85% for 15 minutes.
+      #
+      # How the PromQL works (this one is tricky!):
+      #   node_cpu_seconds_total{mode="idle"} = time spent idle per CPU core
+      #   rate(...[5m])                        = idle rate over 5 minutes
+      #   avg by(instance)                     = average across ALL cores
+      #   * 100                                = convert to percentage
+      #   100 - (...)                          = flip from "idle%" to "busy%"
+      #   > 85                                 = trigger above 85% busy
+      #
+      # Why measure idle and subtract? Because CPU has many modes (user,
+      # system, iowait, etc.) and it's simpler to just measure "not idle"
+      # than to add up all the busy modes.
+      #
+      # "for: 15m" — long wait because CPU spikes during container builds,
+      # backups, and updates are completely normal.
+      - alert: HighCPUUsage
+        expr: >
+          100 - (
+            avg by(instance) (
+              rate(node_cpu_seconds_total{mode="idle"}[5m])
+            ) * 100
+          ) > 85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ High CPU usage on {{ $labels.instance }}"
+          description: >
+            {{ $labels.instance }} CPU usage is at {{ printf "%.1f" $value }}%
+            for the last 15 minutes. Check for runaway processes or
+            resource-heavy containers.
+
+      # ── Instance Down ─────────────────────────────────────────────────────
+      # Fires when Prometheus CANNOT reach a scrape target for 2 minutes.
+      #
+      # How the PromQL works:
+      #   up == 0 — The special "up" metric is set by Prometheus itself.
+      #   It equals 1 if the last scrape succeeded, 0 if it failed.
+      #   So "up == 0" means "this target is unreachable."
+      #
+      # This is one of the most important alerts! If a target goes down,
+      # you lose visibility into that machine/service.
+      #
+      # "for: 2m" — short wait because we want to know quickly if something
+      # is unreachable, but not alert on brief network hiccups.
+      - alert: InstanceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🚨 {{ $labels.instance }} ({{ $labels.job }}) is DOWN"
+          description: >
+            The target {{ $labels.instance }} in job {{ $labels.job }} has
+            been unreachable for more than 2 minutes. Check if the service
+            is running and the network is reachable.
+
+      # ── Container Restarting ──────────────────────────────────────────────
+      # Fires when a Docker container has restarted in the last 5 minutes.
+      #
+      # How the PromQL works:
+      #   increase(container_last_seen{name!=""}[5m]) = 0 means cAdvisor
+      #   hasn't seen the container recently (it disappeared and came back).
+      #
+      #   We also check changes > 0 over the time window to detect restart
+      #   events from cAdvisor's container lifecycle tracking.
+      #
+      # The name!="" filter excludes the "root" cgroup which isn't a real
+      # container.
+      #
+      # This alert catches containers stuck in crash loops (crashing and
+      # restarting over and over), which is a common failure mode.
+      - alert: ContainerRestarting
+        expr: >
+          increase(container_last_seen{name!=""}[5m]) == 0
+          and on(name) container_last_seen{name!=""} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ Container {{ $labels.name }} is restarting"
+          description: >
+            Container {{ $labels.name }} appears to be restarting repeatedly.
+            Check container logs: docker logs {{ $labels.name }}

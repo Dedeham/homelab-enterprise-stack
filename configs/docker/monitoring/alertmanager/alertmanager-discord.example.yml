@@ -1,0 +1,16 @@
+# Optional Alertmanager configuration with native Discord notifications.
+# Do not deploy this file unchanged. Copy it to alertmanager.yml, replace both
+# CHANGE_THIS values, validate it, and then restart Alertmanager.
+
+route:
+  receiver: discord
+  group_by: [alertname, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: discord
+    discord_configs:
+      - webhook_url: https://discord.com/api/webhooks/CHANGE_THIS/CHANGE_THIS
+        send_resolved: true

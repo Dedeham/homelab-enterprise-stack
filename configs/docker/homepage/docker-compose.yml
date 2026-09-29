@@ -1,0 +1,88 @@
+# Homepage — Server Dashboard
+#
+# What is Homepage?
+# ──────────────────
+# Homepage is a beautiful start page / dashboard for your home server.
+# Think of it as a single web page where you can see all your services
+# listed with their status, and click through to each one.
+#
+# It also shows live stats from your services:
+#   • How many movies are in Jellyfin
+#   • How many passwords are in Vaultwarden
+#   • Storage usage from TrueNAS
+#   • CPU/RAM stats from Glances
+#   • Uptime from Uptime Kuma
+#   • And much more via integrations
+#
+# It's purely cosmetic / organisational — removing it changes nothing about
+# how the other services work. But it makes the whole setup feel polished
+# and gives you one place to navigate from.
+#
+# DOCKER SOCKET ACCESS:
+# Homepage needs to read Docker container info to show status indicators.
+# Instead of mounting the raw Docker socket (which would expose ALL container
+# secrets including passwords), it connects to the socket proxy via the
+# DOCKER_HOST environment variable. This is the SAFE way to do it.
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./homepage dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env:         cd /opt/docker/homepage && cp .env.example .env && nano .env
+#   3. Create config dir:   mkdir -p /mnt/main/appdata/homepage
+#   4. Start:               docker compose up -d
+#   5. Access:              https://dash.example.com
+#   6. Configure services in /mnt/main/appdata/homepage/services.yaml
+
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:v0.9.12
+    container_name: homepage
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: Europe/Amsterdam        # ← Change to your timezone
+      # Connect to Docker via the socket proxy instead of the raw socket.
+      # This is MUCH safer — the socket proxy only allows reading container
+      # info and blocks any dangerous operations (creating, deleting, exec).
+      DOCKER_HOST: tcp://socket-proxy:2375
+    volumes:
+      # Config files — define your services, layout, and widgets here.
+      # Edit the YAML files in this directory to customize your dashboard.
+      - /mnt/main/appdata/homepage:/app/config
+      #
+      # NOTE: We do NOT mount /var/run/docker.sock here!
+      # The old config mounted the raw Docker socket, which gave Homepage
+      # read access to ALL container environment variables — including
+      # every password and API key. Instead, we use the socket proxy
+      # via DOCKER_HOST environment variable above.
+    networks:
+      - proxy
+      - socket_proxy    # Needs access to the socket proxy for container status
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.homepage.rule=Host(`dash.${DOMAIN}`)"
+      - "traefik.http.routers.homepage.entrypoints=websecure"
+      - "traefik.http.routers.homepage.tls.certresolver=cloudflare"
+      - "traefik.http.routers.homepage.middlewares=security-headers@file,authelia@docker"
+      - "traefik.http.services.homepage.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+networks:
+  proxy:
+    external: true
+  socket_proxy:
+    external: true    # Defined in Traefik's compose — internal network

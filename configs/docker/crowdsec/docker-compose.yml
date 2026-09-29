@@ -1,0 +1,185 @@
+# CrowdSec — Intrusion Detection & Prevention System
+#
+# What is CrowdSec?
+# ──────────────────
+# CrowdSec is like a neighbourhood watch for your server. It reads your logs
+# (Traefik, SSH, Nextcloud, etc.), spots suspicious behaviour — brute-force
+# logins, vulnerability scanners, credential stuffing — and blocks the attacker
+# before they can do any damage.
+#
+# How does it work?
+# ──────────────────
+# CrowdSec has two parts that work together:
+#
+#   1. ENGINE (crowdsec)
+#      Reads log files, matches them against "scenarios" (rules), and decides
+#      when an IP is misbehaving. When it detects an attack, it adds the IP
+#      to its local ban list. It also shares your detections with the CrowdSec
+#      community — and in return, you receive a curated blocklist of known-bad
+#      IPs that are actively attacking other servers worldwide.
+#
+#   2. BOUNCER (bouncer-traefik)
+#      The enforcement arm. It sits in front of Traefik as a middleware plugin
+#      and checks every incoming request against the ban list. If an IP is
+#      banned — whether by your engine or by the community blocklist — the
+#      bouncer rejects the request before it ever reaches your actual services.
+#
+# Think of it this way:
+#   📖 Engine   = the detective (reads logs, spots bad guys)
+#   🚪 Bouncer  = the door guard (blocks bad guys from entering)
+#
+# Community Blocklists
+# ──────────────────────
+# When you install CrowdSec and register (free), your engine contributes
+# attack signals to the CrowdSec network. In exchange, you receive a shared
+# blocklist of IPs that are attacking other CrowdSec users right now.
+# This means you can block attackers BEFORE they even target your server.
+# It's like a collective immune system — the more people use it, the stronger
+# everyone's protection becomes.
+#
+# BEFORE YOU START:
+# ──────────────────
+#   1. Copy this folder to Docker VM:  scp -r ./crowdsec dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env file:              cd /opt/docker/crowdsec && cp .env.example .env
+#   3. Start the engine first:        docker compose up -d crowdsec
+#   4. Generate bouncer API key:      docker exec -it crowdsec cscli bouncers add bouncer-traefik
+#   5. Copy the key into .env:        nano .env   → paste the key
+#   6. Start everything:              docker compose up -d
+#   7. Verify:                        docker compose ps && docker compose logs -f
+#   8. Register with CrowdSec:        docker exec -it crowdsec cscli console enroll <your-key>
+#      (Get your enrolment key at: https://app.crowdsec.net → Security Engines → Enroll)
+#
+# WHITELISTING YOUR OWN IPs:
+# ────────────────────────────
+# CrowdSec might accidentally flag your own IP if you mistype a password a few
+# times. To prevent this, whitelist your local and public IPs:
+#
+#   1. Create/edit the whitelist file on the host:
+#      nano /mnt/main/appdata/crowdsec/config/parsers/s02-enrich/my-whitelists.yaml
+#
+#   2. Add your IPs (example):
+#      name: my-whitelists
+#      description: "Whitelist my own IPs so I never get locked out"
+#      whitelist:
+#        reason: "My own IP ranges"
+#        ip:
+#          - "192.168.1.0/24"     # ← Your local network range
+#          - "YOUR.PUBLIC.IP"     # ← Your home public IP (find at: whatismyip.com)
+#
+#   3. Restart CrowdSec:  docker compose restart crowdsec
+
+services:
+
+  # ── CrowdSec Engine — reads logs, detects attacks ────────────────────────────
+  #
+  # The engine watches your log files and matches traffic patterns against
+  # "collections" — bundles of parsers + scenarios for specific software.
+  # We load three collections:
+  #   ✅ crowdsecurity/traefik    — detects attacks on your reverse proxy
+  #   ✅ crowdsecurity/http-cve   — catches exploitation of known web CVEs
+  #   ✅ crowdsecurity/nextcloud  — spots brute-force logins on Nextcloud
+  #
+  crowdsec:
+    image: crowdsecurity/crowdsec:v1.6.4
+    container_name: crowdsec
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true   # Prevent container from gaining extra permissions
+    environment:
+      # Collections to install on first boot — space-separated list
+      # Browse more at: https://hub.crowdsec.net/browse
+      COLLECTIONS: "crowdsecurity/traefik crowdsecurity/http-cve crowdsecurity/nextcloud"
+    volumes:
+      # Log files to monitor — mounted read-only so CrowdSec can only READ, not modify
+      - /var/log:/var/log:ro
+      # Persistent data — ban database, downloaded blocklists, hub items
+      - /mnt/main/appdata/crowdsec/data:/var/lib/crowdsec/data
+      # Configuration — parsers, scenarios, whitelists, local overrides
+      - /mnt/main/appdata/crowdsec/config:/etc/crowdsec
+    networks:
+      - crowdsec   # Internal-only network between engine and bouncer
+    # Health check — CrowdSec exposes a local API at port 8080
+    # Docker uses this to know the engine is actually processing, not just running
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Log rotation — prevents logs from filling up your disk over months
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"    # Each log file can be up to 10 MB
+        max-file: "3"      # Keep 3 files maximum (30 MB total worst case)
+    # Resource limits — CrowdSec can be CPU-hungry when processing large log files
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ── Traefik Bouncer — blocks banned IPs at the door ──────────────────────────
+  #
+  # This container runs as a Traefik middleware plugin. For every incoming HTTP
+  # request, Traefik asks the bouncer: "Is this IP allowed?" The bouncer checks
+  # with the CrowdSec engine's local API and either allows or blocks the request.
+  #
+  # HOW TO GENERATE THE BOUNCER API KEY:
+  # ──────────────────────────────────────
+  # The bouncer needs an API key to talk to the CrowdSec engine. Generate it
+  # AFTER the engine is running:
+  #
+  #   docker exec -it crowdsec cscli bouncers add bouncer-traefik
+  #
+  # Copy the displayed key and paste it into your .env file as CROWDSEC_BOUNCER_KEY.
+  # You only need to do this once — the key persists across restarts.
+  #
+  bouncer-traefik:
+    image: fbonalair/traefik-crowdsec-bouncer:0.6.0
+    container_name: bouncer-traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # API key for the bouncer to authenticate with the CrowdSec engine
+      CROWDSEC_BOUNCER_API_KEY: ${CROWDSEC_BOUNCER_KEY}
+      # Where to find the CrowdSec engine's local API (container_name:port)
+      CROWDSEC_AGENT_HOST: crowdsec:8080
+    networks:
+      - crowdsec   # Talks to the CrowdSec engine on the internal network
+      - proxy      # Traefik can reach this bouncer to check IPs
+    depends_on:
+      - crowdsec
+    labels:
+      # Register as a Traefik middleware — other services reference this as
+      # "crowdsec@docker" in their middleware chain to enable IP blocking
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.crowdsec.plugin.bouncer.enabled=true"
+      - "traefik.http.middlewares.crowdsec.plugin.bouncer.crowdseclapihost=crowdsec:8080"
+    # Log rotation
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Resource limits — the bouncer is lightweight, it just does API lookups
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+
+# ── Network definitions ────────────────────────────────────────────────────────
+#
+# crowdsec:  A private, internal-only network between the CrowdSec engine and
+#            the bouncer. No internet access — the engine and bouncer communicate
+#            here without exposing the CrowdSec API to anything else.
+#
+# proxy:     The shared Traefik network. The bouncer joins this so Traefik can
+#            reach it as a middleware. Created by the Traefik compose file.
+#
+networks:
+  crowdsec:
+    internal: true   # No internet access — only engine ↔ bouncer
+  proxy:
+    external: true

@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  📊 GRAFANA — Auto-Provisioned Dashboard Provider
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  This file tells Grafana where to find dashboard JSON files and how to
+#  load them automatically. Instead of manually importing dashboards through
+#  the UI, you just drop JSON files into a folder and Grafana picks them up.
+#
+#  ── How to add dashboards ──────────────────────────────────────────────────
+#
+#  1. Go to https://grafana.com/grafana/dashboards/
+#  2. Search for a dashboard (e.g., "Node Exporter Full")
+#  3. Click on the dashboard → "Download JSON"
+#  4. Place the JSON file in:
+#       grafana/provisioning/dashboards/json/
+#  5. Grafana will automatically detect and import it within 30 seconds
+#     (controlled by updateIntervalSeconds below)
+#
+#  ── Recommended dashboards for your homelab ────────────────────────────────
+#
+#  ✅ Node Exporter Full (ID: 1860)
+#     The gold standard for system metrics. Shows CPU, memory, disk, network,
+#     and much more for each host running Node Exporter.
+#     Download: https://grafana.com/grafana/dashboards/1860
+#
+#  ✅ Docker Container Monitoring (ID: 893)
+#     Visualizes per-container CPU, memory, network, and disk usage from
+#     cAdvisor metrics.
+#     Download: https://grafana.com/grafana/dashboards/893
+#
+#  ✅ Traefik (ID: 17346)
+#     Shows Traefik request rates, response times, status codes, and
+#     TLS certificate expiration dates.
+#     Download: https://grafana.com/grafana/dashboards/17346
+#
+#  ✅ Alertmanager (ID: 9578)
+#     Shows current alerts, alert history, and notification status.
+#     Download: https://grafana.com/grafana/dashboards/9578
+#
+#  ── How to download a dashboard by ID ──────────────────────────────────────
+#
+#  You can also download dashboards using curl:
+#
+#    # Replace 1860 with the dashboard ID you want
+#    curl -o grafana/provisioning/dashboards/json/node-exporter-full.json \
+#      "https://grafana.com/api/dashboards/1860/revisions/latest/download"
+#
+#  ── BEFORE YOU START ───────────────────────────────────────────────────────
+#
+#  ✅ Create the JSON directory on the host:
+#       mkdir -p grafana/provisioning/dashboards/json
+#
+#  ✅ Make sure the directory is accessible inside the container. The
+#     docker-compose.yml mounts ./grafana/provisioning → /etc/grafana/provisioning
+#     so the JSON files will be at /etc/grafana/provisioning/dashboards/json/
+#     inside the container.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: 1
+
+providers:
+  - name: default                        # Provider name (shown in Grafana's dashboard settings)
+    orgId: 1                             # Organization ID (1 = default org)
+    folder: ''                           # Root folder (empty = dashboards appear at top level)
+    type: file                           # Load dashboards from local JSON files
+    disableDeletion: false               # Allow dashboards to be deleted via the UI
+    editable: true                       # Allow dashboards to be edited via the UI
+    updateIntervalSeconds: 30            # Check for new/changed JSON files every 30 seconds
+    options:
+      path: /etc/grafana/provisioning/dashboards/json    # Path INSIDE the container
+      foldersFromFilesStructure: false                    # Don't create folders from directory structure

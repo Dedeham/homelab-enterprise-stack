@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  📈 PROMETHEUS — Scrape Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  This file tells Prometheus WHAT to monitor and HOW OFTEN.
+#
+#  ── What is "scraping"? ────────────────────────────────────────────────────
+#
+#  Prometheus works on a "pull" model. Instead of services pushing metrics
+#  TO Prometheus, Prometheus reaches out to each service and "scrapes"
+#  (downloads) metrics FROM them. Each service exposes a /metrics endpoint
+#  that returns all its metrics in a simple text format.
+#
+#  For example, if you visit http://node-exporter:9100/metrics in a browser,
+#  you'd see something like:
+#
+#    node_cpu_seconds_total{cpu="0",mode="idle"} 123456.78
+#    node_memory_MemAvailable_bytes 4294967296
+#    node_filesystem_avail_bytes{mountpoint="/"} 53687091200
+#
+#  Prometheus downloads this data every 15 seconds (the "scrape_interval")
+#  and stores it in its time-series database with timestamps.
+#
+#  ── What are "targets"? ────────────────────────────────────────────────────
+#
+#  A "target" is a host:port combination that Prometheus scrapes. Targets
+#  can be:
+#    • Docker containers on the same network (use container name as hostname)
+#    • Remote machines on your LAN (use their IP address)
+#
+#  ── What are "jobs"? ───────────────────────────────────────────────────────
+#
+#  A "job" is a group of related targets. For example, all your node
+#  exporters across different machines would be one "job" called
+#  "node-exporter". Jobs add a "job" label to all metrics, making it easy
+#  to filter in Grafana.
+#
+#  ── BEFORE YOU START ───────────────────────────────────────────────────────
+#
+#  ✅ Verify all IP addresses match your network setup
+#  ✅ Make sure node_exporter is installed on TrueNAS and Proxmox hosts
+#  ✅ Make sure Traefik's metrics endpoint is enabled (entryPoint: metrics)
+#  ✅ Test connectivity: curl http://<target-ip>:<port>/metrics
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Global Settings ─────────────────────────────────────────────────────────
+# These apply to ALL scrape jobs unless overridden per-job.
+global:
+  scrape_interval: 15s        # How often to scrape metrics (every 15 seconds)
+  evaluation_interval: 15s    # How often to evaluate alert rules (every 15 seconds)
+
+# ── Alert Rules ─────────────────────────────────────────────────────────────
+# Load alert rules from YAML files in the rules directory.
+# Prometheus evaluates these rules every "evaluation_interval" (15s) and
+# sends any triggered alerts to Alertmanager.
+rule_files:
+  - '/etc/prometheus/rules/*.yml'    # All .yml files in the rules directory
+
+# ── Alertmanager Connection ─────────────────────────────────────────────────
+# Tell Prometheus where Alertmanager is running so it can send alerts.
+# Alertmanager is on the same Docker network, so we use its container name.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'    # Alertmanager container on the monitoring network
+
+# ── Scrape Targets ──────────────────────────────────────────────────────────
+# Each "job" defines a group of targets to scrape. The job name becomes a
+# label on all metrics from that job, making it easy to filter in Grafana.
+scrape_configs:
+
+  # ── Prometheus Self-Monitoring ────────────────────────────────────────────
+  # Prometheus monitors itself! This is useful for tracking:
+  #   • How much memory Prometheus is using
+  #   • How many time series are stored
+  #   • How long scrapes take
+  #   • Whether any scrape targets are failing
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          instance: 'prometheus'       # Friendly name for this target
+
+  # ── Docker Host Metrics (Node Exporter) ───────────────────────────────────
+  # Collects system-level metrics from the machine running Docker:
+  #   • CPU usage, load averages
+  #   • Memory (RAM) usage and availability
+  #   • Disk space and I/O per mount point
+  #   • Network traffic per interface
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          instance: 'docker-host'      # Label to identify this machine in dashboards
+
+  # ── TrueNAS Metrics (Node Exporter on TrueNAS) ───────────────────────────
+  # Collects system metrics from your TrueNAS server.
+  # This assumes you've installed node_exporter on TrueNAS.
+  #
+  # To install on TrueNAS SCALE:
+  #   1. SSH into TrueNAS
+  #   2. Install node_exporter as a system service or TrueNAS app
+  #   3. Verify: curl http://192.168.1.10:9100/metrics
+  #
+  # ⚠️  UPDATE the IP address below to match YOUR TrueNAS server!
+  - job_name: 'truenas'
+    static_configs:
+      - targets: ['192.168.1.10:9100']
+        labels:
+          instance: 'truenas'
+
+  # ── Proxmox Host Metrics (Node Exporter on Proxmox) ──────────────────────
+  # Collects system metrics from your Proxmox hypervisor host.
+  # This assumes you've installed node_exporter on the Proxmox host.
+  #
+  # To install on Proxmox:
+  #   apt install prometheus-node-exporter
+  #   systemctl enable --now prometheus-node-exporter
+  #   Verify: curl http://192.168.1.2:9100/metrics
+  #
+  # ⚠️  UPDATE the IP address below to match YOUR Proxmox host!
+  - job_name: 'proxmox'
+    static_configs:
+      - targets: ['192.168.1.2:9100']
+        labels:
+          instance: 'proxmox'
+
+  # ── Container Metrics (cAdvisor) ──────────────────────────────────────────
+  # Collects per-container metrics from Docker:
+  #   • CPU usage per container
+  #   • Memory usage and limits per container
+  #   • Network I/O per container
+  #   • Container restart counts
+  #
+  # cAdvisor is on the same Docker network, so we use its container name.
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+        labels:
+          instance: 'docker-containers'
+
+  # ── Traefik Reverse Proxy Metrics ─────────────────────────────────────────
+  # Collects metrics from Traefik's built-in metrics endpoint:
+  #   • Request count and duration per route
+  #   • HTTP status code distribution
+  #   • TLS certificate expiration dates
+  #   • Open connections count
+  #
+  # This requires Traefik to have metrics enabled in its static config:
+  #   metrics:
+  #     prometheus:
+  #       entryPoint: metrics    # Usually on port 8082
+  #
+  # Traefik is on the proxy network, accessible by container name.
+  - job_name: 'traefik'
+    static_configs:
+      - targets: ['traefik:8082']
+        labels:
+          instance: 'traefik'

@@ -1,0 +1,17 @@
+# Boot-safe Alertmanager baseline.
+#
+# Alerts remain visible in Alertmanager, but no external notification is sent.
+# This is intentional: a checked-in placeholder webhook makes Alertmanager reject
+# its configuration and enter a restart loop. After this baseline is healthy,
+# follow docs/monitoring/monitoring-and-updates-start-here.md to enable one real
+# notification receiver at a time.
+
+route:
+  receiver: local-only
+  group_by: [alertname, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: local-only

@@ -1,0 +1,218 @@
+# Authelia — Authentication Gateway
+#
+# What is Authelia?
+# ─────────────────
+# Authelia is a single sign-on (SSO) and two-factor authentication (2FA)
+# gateway that sits in front of all your self-hosted services. When someone
+# tries to access cloud.example.com, Traefik asks Authelia: "Is this person
+# allowed in?" If they haven't logged in yet, Authelia shows a login page and
+# (optionally) asks for a 2FA code before letting them through.
+#
+# Think of it like a security guard at the entrance of a building:
+# ✅ One login protects ALL your services — no need for separate passwords
+# ✅ 2FA support (TOTP apps like Google Authenticator, Authy, or Aegis)
+# ✅ Access control — define who can reach which services
+# ✅ Brute-force protection — locks accounts after too many failed attempts
+# ✅ Session management — stay logged in across services for a set period
+#
+# What is "Forward Auth"?
+# ───────────────────────
+# Forward auth is the mechanism Traefik uses to check with Authelia.
+# When a request arrives, Traefik "forwards" the authentication question
+# to Authelia's API endpoint. Authelia checks if the user has a valid session.
+# If yes → the request passes through to the service.
+# If no  → the user is redirected to the Authelia login page.
+#
+# This is what the middleware labels below define — they create a Traefik
+# middleware called "authelia@docker" that other services reference.
+# For example, in vaultwarden's docker-compose you'll see:
+#   traefik.http.routers.vaultwarden.middlewares=authelia@docker
+# That single line is what makes Vaultwarden require Authelia login.
+#
+# Why does 2FA matter?
+# ────────────────────
+# Without 2FA, if someone steals or guesses your password, they're in.
+# With 2FA, they ALSO need your phone (for the TOTP code) — something they
+# almost certainly don't have. For services like your password manager and
+# cloud storage, this extra step is essential. Even a strong password can be
+# leaked in a data breach; 2FA ensures a leaked password alone is worthless.
+#
+# How does Authelia protect your services?
+# ────────────────────────────────────────
+# 1. Default deny policy  → Everything is blocked unless explicitly allowed
+# 2. Per-service rules    → You decide which services need 2FA vs just a password
+# 3. Brute-force regulation → Auto-bans IPs after repeated failed login attempts
+# 4. Encrypted sessions   → Session cookies are signed and encrypted
+# 5. No direct exposure   → Authelia is only reachable through Traefik
+#
+# BEFORE YOU START:
+#   1. Create the config directory:  mkdir -p /mnt/main/appdata/authelia/config
+#   2. Create configuration.yml:     nano /mnt/main/appdata/authelia/config/configuration.yml
+#   3. Create users_database.yml:    nano /mnt/main/appdata/authelia/config/users_database.yml
+#   4. Generate a session secret:    openssl rand -base64 64
+#   5. Generate a storage key:       openssl rand -base64 64
+#   6. Generate a JWT secret:        openssl rand -base64 64
+#   7. Start Authelia:               docker compose up -d
+#   8. Verify it's healthy:          docker compose ps && docker compose logs -f
+
+services:
+
+  # ── Authelia — the authentication gateway ──────────────────────────────────
+  authelia:
+    image: authelia/authelia:4.38.18
+    container_name: authelia
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true    # Prevent container from gaining extra permissions
+    volumes:
+      # Authelia configuration and user database — stored on ZFS main pool
+      # This directory must contain configuration.yml and users_database.yml
+      # (see the "Required Config Files" section at the bottom of this file)
+      - /mnt/main/appdata/authelia/config:/config
+    environment:
+      TZ: Europe/Amsterdam         # Timezone for logs and session expiry
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+
+      # ── Authelia's own web UI route ──────────────────────────────────────
+      # This is the login page users see when they haven't authenticated yet.
+      # It must be publicly accessible (no authelia middleware on itself!)
+      - "traefik.http.routers.authelia.rule=Host(`auth.${DOMAIN}`)"
+      - "traefik.http.routers.authelia.entrypoints=websecure"
+      - "traefik.http.routers.authelia.tls.certresolver=cloudflare"
+      - "traefik.http.services.authelia.loadbalancer.server.port=9091"
+
+      # ── Forward Auth Middleware (THIS IS THE CRITICAL PART) ──────────────
+      #
+      # These labels define the "authelia@docker" middleware that every other
+      # service references to require authentication.
+      #
+      # How it works:
+      # 1. A user visits vault.example.com
+      # 2. Traefik sees the middleware "authelia@docker" on that route
+      # 3. Traefik sends a subrequest to Authelia's forward-auth endpoint
+      # 4. Authelia checks the user's session cookie
+      # 5a. Valid session → Authelia responds 200 + user info headers → Traefik
+      #     forwards the original request to Vaultwarden
+      # 5b. No/invalid session → Authelia responds 401 → Traefik redirects the
+      #     user to auth.example.com to log in
+      #
+      # The authResponseHeaders pass the authenticated user's identity to the
+      # backend service, so services can know WHO is logged in without needing
+      # their own authentication.
+      #
+      - "traefik.http.middlewares.authelia.forwardAuth.address=http://authelia:9091/api/authz/forward-auth"
+      - "traefik.http.middlewares.authelia.forwardAuth.trustForwardHeader=true"
+      - "traefik.http.middlewares.authelia.forwardAuth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
+
+    # Health check — Docker uses this to know if Authelia is actually working
+    # Authelia exposes a health endpoint at /api/health
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9091/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s    # Give Authelia time to start before checking
+
+    # Log rotation — prevents logs from filling up your disk over months
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"    # Each log file can be up to 10 MB
+        max-file: "3"      # Keep 3 files maximum (30 MB total worst case)
+
+    # Resource limits — prevents Authelia from consuming all available RAM/CPU
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+# ── Network definitions ──────────────────────────────────────────────────────
+#
+# proxy:  The shared network that ALL web services join. Traefik can see
+#         any container on this network and route traffic to it.
+#         Created by Traefik's docker-compose — we reference it as external.
+#
+networks:
+  proxy:
+    external: true
+
+# ── Required Config Files ────────────────────────────────────────────────────
+#
+# Authelia needs two files in /mnt/main/appdata/authelia/config/:
+#
+# 1. configuration.yml — Main settings file
+#    ─────────────────
+#    Key settings you MUST configure:
+#
+#    theme: dark                           # or "light" — the login page theme
+#
+#    server:
+#      address: 'tcp://0.0.0.0:9091/'     # Listen on all interfaces, port 9091
+#
+#    session:
+#      cookies:
+#        - domain: 'example.com'       # ← CHANGE to your domain
+#          authelia_url: 'https://auth.example.com'
+#          default_redirection_url: 'https://example.com'
+#
+#    authentication_backend:
+#      file:
+#        path: /config/users_database.yml  # Points to the user database
+#
+#    access_control:
+#      default_policy: deny                # ← IMPORTANT: deny everything by default
+#      rules:
+#        # Allow the Authelia login page itself (otherwise infinite redirect loop)
+#        - domain: 'auth.example.com'
+#          policy: bypass
+#
+#        # Services that require 2FA to access
+#        - domain: 'vault.example.com'
+#          policy: two_factor
+#
+#        - domain: 'monitor.example.com'
+#          policy: two_factor
+#
+#        - domain: 'dash.example.com'
+#          policy: two_factor
+#
+#        # Add more services as you deploy them:
+#        # - domain: 'cloud.example.com'
+#        #   policy: two_factor
+#
+#    regulation:
+#      max_retries: 3                      # Lock account after 3 failed attempts
+#      find_time: 2m                       # Within a 2-minute window
+#      ban_time: 5m                        # Ban for 5 minutes
+#
+#    storage:
+#      local:
+#        path: /config/db.sqlite3          # Authelia's internal database
+#
+#    notifier:
+#      filesystem:
+#        filename: /config/notification.txt  # For testing — emails go to a file
+#      # For production, replace with SMTP:
+#      # smtp:
+#      #   address: 'smtp://smtp.gmail.com:587'
+#      #   username: 'your@gmail.com'
+#      #   password: 'your_app_password'
+#      #   sender: 'auth@example.com'
+#
+# 2. users_database.yml — User accounts
+#    ──────────────────
+#    Generate a password hash:
+#      docker run --rm authelia/authelia:4.38.18 authelia crypto hash generate argon2 --password 'YOUR_PASSWORD'
+#
+#    Example format:
+#      users:
+#        yourusername:
+#          displayname: "Your Name"
+#          password: "$argon2id$v=19$m=65536,t=3,p=4$..."  # ← paste hash here
+#          email: you@example.com
+#          groups:
+#            - admins

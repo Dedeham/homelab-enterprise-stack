@@ -1,0 +1,161 @@
+# Traefik — Reverse Proxy Configuration
+#
+# What is Traefik?
+# ────────────────
+# Traefik is the "front door" of your server. Every request that comes in —
+# whether from the internet via Cloudflare Tunnel or from your local network —
+# goes through Traefik first. Traefik looks at the domain name in the request
+# and forwards it to the right service (e.g., cloud.example.com → Nextcloud).
+#
+# It also handles SSL certificates automatically — it talks to Let's Encrypt,
+# gets a certificate for your domain, and renews it before it expires.
+# You never have to think about SSL again.
+#
+# Why Cloudflare DNS challenge?
+# Because we want a wildcard certificate (*.example.com) that covers ALL
+# your subdomains at once. The DNS challenge lets Let's Encrypt verify you own
+# the domain without needing to open port 80 to the internet.
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./traefik alice@192.168.1.20:/opt/stacks/
+#   2. Create .env file:             cd /opt/stacks/traefik && cp .env.example .env && nano .env
+#   3. Create certs directory:       mkdir -p /opt/stacks/traefik/certs
+#   4. Create acme.json:             touch /opt/stacks/traefik/certs/acme.json && chmod 600 /opt/stacks/traefik/certs/acme.json
+#   5. Edit traefik.yml:             Change domain and email (marked with ← CHANGE THIS)
+#   6. Create proxy network:         docker network create proxy
+#   7. Start:                        docker compose up -d
+#   8. Verify:                       docker compose ps && docker compose logs -f
+
+services:
+
+  # ── Traefik — the reverse proxy ─────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.7.5
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true   # Prevent container from gaining extra permissions
+    ports:
+      - "80:80"     # HTTP — immediately redirected to HTTPS by Traefik config
+      - "443:443"   # HTTPS — all real traffic goes here
+    environment:
+      CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}   # Your Cloudflare API token (from .env)
+      DOCKER_API_VERSION: "1.40"              # Match modern Docker daemon minimum API
+    volumes:
+      # Traefik configuration files — mounted read-only for security
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro         # Main config (read-only)
+      - ./dynamic/:/etc/traefik/dynamic/:ro               # Per-service rules (read-only)
+      - ./certs/acme.json:/acme.json                      # Where SSL certs are stored
+      - ./logs:/var/log/traefik                           # Access logs for CrowdSec
+      #
+      # NOTE: No Docker socket mount here!
+      # Traefik talks to Docker through the socket-proxy service (see below)
+      # via TCP on the socket_proxy network. This is MUCH safer than mounting
+      # the raw Docker socket, which would give Traefik full control over Docker.
+    networks:
+      - proxy         # Shared network — all web services join this
+      - socket_proxy  # Private network between Traefik and the Docker socket proxy
+    depends_on:
+      - socket-proxy
+    labels:
+      # Traefik's own dashboard — internal only.
+      # Start with IP allowlisting; add authelia@docker after Authelia is deployed.
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=cloudflare"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=admin-whitelist@file,security-headers@file"
+    # Health check — Traefik has a built-in /ping endpoint (enabled in traefik.yml)
+    # Docker uses this to know if Traefik is actually working, not just running
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Log rotation — prevents logs from filling up your disk over months
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"    # Each log file can be up to 10 MB
+        max-file: "3"      # Keep 3 files maximum (30 MB total worst case)
+    # Resource limits — prevents Traefik from consuming all available RAM/CPU
+    # if something goes wrong (e.g., a flood of requests)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+  # ── Docker Socket Proxy — safe access to Docker for Traefik ────────────────
+  #
+  # Why is this needed?
+  # Traefik needs to read Docker labels to know how to route traffic.
+  # But the Docker socket (/var/run/docker.sock) is essentially a master key —
+  # anyone who has it can control your entire Docker installation: create/delete
+  # containers, read secrets and passwords from environment variables, etc.
+  #
+  # The socket proxy sits in between like a receptionist:
+  # - It allows Traefik to READ container info (labels, networks) — ✅
+  # - It blocks Traefik from CREATING, DELETING, or EXECUTING anything — ❌
+  # - It never exposes the raw socket to any other container
+  #
+  # SECURITY NOTE: This container does NOT run as privileged.
+  # Previous versions incorrectly set privileged: true, which would give this
+  # container unrestricted access to the host — defeating its entire purpose.
+  # The socket proxy only needs the Docker socket mounted read-only.
+  #
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.4.2  # Pinned version — never use :latest here
+    container_name: socket-proxy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # Read-only access to Docker
+    environment:
+      # Only what Traefik needs — everything else is OFF
+      CONTAINERS: 1        # ✅ List containers (Traefik needs this to find services)
+      SERVICES: 1          # ✅ List services
+      NETWORKS: 1          # ✅ List networks (Traefik needs to know which network to route on)
+      TASKS: 1             # ✅ List tasks
+      EVENTS: 1            # ✅ Watch for new/stopped containers (auto-discovery)
+      # Explicitly block dangerous operations — if any of these were 1,
+      # a compromised Traefik could take over your entire server
+      AUTH: 0              # ❌ Cannot access auth endpoints
+      SECRETS: 0           # ❌ Cannot read Docker secrets
+      POST: 0              # ❌ Cannot create/delete/modify anything
+      BUILD: 0             # ❌ Cannot build images
+      COMMIT: 0            # ❌ Cannot commit container changes
+      IMAGES: 0            # ❌ Cannot pull/delete images
+      EXEC: 0              # ❌ Cannot run commands inside containers
+    networks:
+      - socket_proxy       # Only accessible by Traefik on this private network
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.5'
+
+# ── Network definitions ────────────────────────────────────────────────────────
+#
+# proxy:        The shared network that ALL web services join. Traefik can see
+#               any container on this network and route traffic to it.
+#               Other compose files reference this as "external: true".
+#
+# socket_proxy: A private, internal-only network between Traefik and the
+#               socket proxy. No internet access, no other containers can join.
+#               This keeps the Docker socket completely isolated.
+#
+networks:
+  proxy:
+    name: proxy
+    external: true
+  socket_proxy:
+    name: socket_proxy
+    internal: true    # No internet access — only Traefik ↔ socket-proxy

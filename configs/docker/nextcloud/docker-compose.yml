@@ -1,0 +1,266 @@
+# Nextcloud — Self-hosted Cloud Storage
+#
+# What is Nextcloud?
+# ──────────────────
+# Nextcloud is your personal Google Drive / Dropbox replacement.
+# It syncs files across your devices, manages contacts and calendars,
+# and can be extended with hundreds of apps. Your data stays on your server —
+# no one else has access to it.
+#
+# This stack includes 4 containers that work together:
+#
+# ┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
+# │  Nextcloud  │───▶│   MariaDB    │    │      Redis      │
+# │  (the app)  │    │ (database)   │    │ (speed cache +  │
+# │             │    │              │    │  file locking)  │
+# └─────────────┘    └──────────────┘    └─────────────────┘
+#        │
+# ┌──────┴──────┐
+# │  Cron job   │  (runs background tasks every 15 min)
+# └─────────────┘
+#
+# Why MariaDB instead of SQLite?
+#   SQLite is fine for testing but breaks under concurrent access.
+#   MariaDB handles multiple users/devices syncing at the same time properly.
+#
+# Why Redis?
+#   Without Redis, when multiple devices sync at the same time, Nextcloud
+#   can get confused about which version of a file is correct. Redis acts
+#   as a "traffic controller" (file locking) preventing conflicts. It also
+#   caches database queries so the UI loads faster.
+#
+# Why NO Authelia on Nextcloud?
+#   Unlike other services, Nextcloud has its own built-in authentication system
+#   with 2FA support. Putting Authelia in front would BREAK desktop and mobile
+#   sync clients — they use app passwords and can't handle Authelia's browser
+#   login flow. Nextcloud's own auth is robust enough on its own.
+#
+# STORAGE: Nextcloud stores all user files on your ZFS "main" pool.
+# The /mnt/main/nextcloud path is a ZFS dataset, so all files are:
+#   ✅ Protected by ZFS mirror (real-time copy on 2nd drive)
+#   ✅ Covered by ZFS snapshots (instant rollback)
+#   ✅ Protected by your off-site backup
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./nextcloud dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env:         cd /opt/docker/nextcloud && cp .env.example .env && nano .env
+#   3. In TrueNAS, create datasets main/nextcloud and main/appdata/nextcloud-db
+#   4. Start:               docker compose up -d
+#   5. Wait 1-2 minutes for database initialization on first run
+#   6. Access:              https://cloud.example.com
+
+services:
+
+  # ── The main Nextcloud application ──────────────────────────────────────────
+  nextcloud:
+    image: nextcloud:33-apache    # Supported major; pull deliberately for maintenance updates
+    container_name: nextcloud
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      nextcloud-db:
+        condition: service_healthy    # Wait for database to be READY, not just started
+      nextcloud-redis:
+        condition: service_healthy
+    environment:
+      # Database connection — Nextcloud talks to MariaDB on the internal network
+      MYSQL_HOST: nextcloud-db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+
+      # Admin account — only used on the very first run to create your account.
+      # After that, changing these values does nothing.
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+
+      # Your domain — Nextcloud needs to know this to build correct URLs
+      # in emails, sharing links, and the sync client configuration.
+      NEXTCLOUD_TRUSTED_DOMAINS: cloud.${DOMAIN}
+
+      # Tell Nextcloud it's behind a reverse proxy (Traefik).
+      # Without these, Nextcloud generates broken HTTP links inside an HTTPS site,
+      # and sharing links won't work correctly.
+      OVERWRITEPROTOCOL: https
+      OVERWRITECLIURL: https://cloud.${DOMAIN}
+
+      # Only trust the Traefik proxy on the Docker network.
+      # This range covers Docker's default bridge networks.
+      # If Nextcloud trusted ALL proxies, an attacker could forge headers to
+      # pretend they're coming from a different IP address.
+      TRUSTED_PROXIES: 172.18.0.0/16
+
+      # Redis connection for caching and file locking
+      REDIS_HOST: nextcloud-redis
+      REDIS_HOST_PORT: 6379
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+
+      # PHP tuning — how much memory Nextcloud can use and max upload size
+      PHP_MEMORY_LIMIT: 1024M
+      PHP_UPLOAD_LIMIT: 10G    # Max single file upload size
+
+    volumes:
+      # Nextcloud app files (code, config, themes)
+      - nextcloud_app:/var/www/html
+      # User data — stored on ZFS main pool for protection + snapshots
+      - /mnt/main/nextcloud:/var/www/html/data
+    networks:
+      - proxy                  # Reachable by Traefik (has internet-facing route)
+      - nextcloud_internal     # Private: only Nextcloud can talk to its DB/Redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nextcloud.rule=Host(`cloud.${DOMAIN}`)"
+      - "traefik.http.routers.nextcloud.entrypoints=websecure"
+      - "traefik.http.routers.nextcloud.tls.certresolver=cloudflare"
+      # NOTE: No authelia@docker here — Nextcloud has its own auth system.
+      # Adding Authelia would break desktop/mobile sync clients.
+      - "traefik.http.routers.nextcloud.middlewares=nextcloud-caldav,nextcloud-headers@file,security-headers@file,rate-limit@file"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+      # CalDAV/CardDAV redirects — required for calendar and contacts sync apps.
+      # Without these, apps like Thunderbird and iOS Calendar can't find the
+      # sync endpoint automatically.
+      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.regex=^https://cloud.${DOMAIN}/.well-known/(card|cal)dav"
+      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.replacement=https://cloud.${DOMAIN}/remote.php/dav/"
+      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.permanent=true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s       # Give Nextcloud 2 minutes to start on first run
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+
+  # ── Cron — runs Nextcloud background jobs every 15 minutes ─────────────────
+  # Background jobs handle things like: sending notifications, cleaning temp
+  # files, updating the file index. Without this container, some Nextcloud
+  # features silently stop working (like email notifications and file previews).
+  nextcloud-cron:
+    image: nextcloud:33-apache    # Must match the main Nextcloud image exactly
+    container_name: nextcloud-cron
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - nextcloud_app:/var/www/html
+      - /mnt/main/nextcloud:/var/www/html/data
+    entrypoint: /cron.sh   # Override the startup command to just run cron
+    depends_on:
+      - nextcloud-db
+      - nextcloud-redis
+    networks:
+      - nextcloud_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ── MariaDB — the database ────────────────────────────────────────────────
+  # Stores everything EXCEPT actual file contents:
+  # user accounts, file metadata, sharing settings, app configs, etc.
+  # Think of it as the "brain" while the files are the "body".
+  nextcloud-db:
+    image: mariadb:11.4
+    container_name: nextcloud-db
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      # These settings are required/recommended by Nextcloud's documentation.
+      # They control how MariaDB handles concurrent writes and binary logging.
+      - "--transaction-isolation=READ-COMMITTED"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+      - "--innodb-file-per-table=1"
+      - "--skip-innodb-read-only-compressed"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${NEXTCLOUD_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+    volumes:
+      # DB files on ZFS main pool — protected by mirror + snapshots
+      - /mnt/main/appdata/nextcloud-db:/var/lib/mysql
+    networks:
+      - nextcloud_internal   # NOT reachable from outside — only by Nextcloud
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+
+  # ── Redis — caching and file locking ──────────────────────────────────────
+  # Keeps frequently-used data in RAM so the database doesn't get hammered
+  # with the same queries over and over. Also acts as a "lock manager" so
+  # two devices can't modify the same file simultaneously (prevents data
+  # corruption during concurrent sync).
+  nextcloud-redis:
+    image: redis:7-alpine
+    container_name: nextcloud-redis
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Redis password adds defense-in-depth: even if another container somehow
+    # joins this internal network, it can't access the cache without the password.
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+    networks:
+      - nextcloud_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+          cpus: '0.5'
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  proxy:
+    external: true   # Defined in Traefik's compose file — shared by all web services
+  nextcloud_internal:
+    internal: true   # No internet access — only Nextcloud ↔ MariaDB ↔ Redis
+                     # This means the database is completely invisible from the internet
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  nextcloud_app:
+    # App code/config — stored in Docker volume (fast, on SSD)
+    # User DATA is on /mnt/main/nextcloud (ZFS protected)

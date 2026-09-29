@@ -1,0 +1,125 @@
+# Traefik Dynamic Configuration — Reusable Middleware
+#
+# What is middleware?
+# ──────────────────
+# "Middleware" in Traefik is like a chain of security checks that every request
+# must pass through before it reaches your service. Think of it like airport
+# security — a request has to go through each gate before boarding the plane.
+#
+# Each middleware defined here can be applied to any service using a Traefik label.
+# Example: - "traefik.http.routers.myapp.middlewares=security-headers@file,rate-limit@file"
+#
+# The "@file" suffix tells Traefik "this middleware is defined in a file"
+# (as opposed to "@docker" which means "defined in Docker labels").
+
+http:
+  middlewares:
+
+    # ── Security Headers ─────────────────────────────────────────────────────
+    # These are HTTP headers that instruct the browser on how to behave safely.
+    # When a browser receives these headers, it enables built-in protections
+    # that make it much harder for attackers to exploit your services.
+    #
+    # You apply this to every service:
+    #   - "traefik.http.routers.myapp.middlewares=security-headers@file"
+    #
+    security-headers:
+      headers:
+        # HSTS: Tells browsers "ALWAYS use HTTPS for this domain" (for 1 year).
+        # After a browser sees this once, it won't even TRY HTTP anymore —
+        # it automatically upgrades every request to HTTPS before sending it.
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: false
+        forceSTSHeader: true
+
+        # Prevent browsers from guessing the content type.
+        # Without this, a browser might treat a .txt file as JavaScript
+        # and execute it — which is a common attack vector.
+        contentTypeNosniff: true
+
+        # Block clickjacking — prevents your site from being embedded in
+        # another site's iframe. Without this, an attacker could overlay
+        # your login page with invisible elements to steal your password.
+        frameDeny: true
+
+        # XSS filter — enables the browser's built-in cross-site scripting
+        # protection as an extra safety net.
+        browserXssFilter: true
+
+        # Controls how much referrer information is sent when clicking links.
+        # "strict-origin-when-cross-origin" = send full URL to same site,
+        # but only send the domain (not the path) when going to other sites.
+        referrerPolicy: "strict-origin-when-cross-origin"
+
+        # Permissions Policy — controls which browser features your site can use.
+        # We disable everything we don't need to minimize the attack surface.
+        permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=()"
+
+        # NOTE: Content-Security-Policy (CSP) is NOT set here globally.
+        # Each service (Nextcloud, Jellyfin, etc.) has different needs for
+        # scripts, styles, and images. Setting a global CSP would break most
+        # services. Instead, let each service set its own CSP via its own headers.
+
+        # Remove headers that reveal server/technology info to potential attackers.
+        # An attacker who knows you run "Apache 2.4.51" can search for known
+        # vulnerabilities in that exact version. By hiding this info, they have
+        # to work much harder.
+        customResponseHeaders:
+          X-Powered-By: ""      # Hide what technology runs the app
+          Server: ""            # Hide which web server software is used
+
+    # ── Rate Limiter ──────────────────────────────────────────────────────────
+    # Limits how many requests a single IP can make per second.
+    #
+    # Why this matters:
+    # Without rate limiting, an attacker can try thousands of passwords per
+    # second against your login page (brute-force attack). With rate limiting,
+    # they get maybe 100 attempts per second before being throttled — which
+    # makes brute-force attacks impractical.
+    #
+    # Apply this to public-facing services:
+    #   - "traefik.http.routers.vaultwarden.middlewares=rate-limit@file,security-headers@file"
+    #
+    rate-limit:
+      rateLimit:
+        average: 100     # Allow 100 requests per second on average
+        burst: 50        # Allow short bursts up to 50 extra (for page loads with many assets)
+
+    # ── Nextcloud-specific headers ────────────────────────────────────────────
+    # Nextcloud requires specific headers to work correctly behind a reverse proxy.
+    # Without these, Nextcloud gets confused about whether it's running on
+    # HTTP or HTTPS and generates broken links in emails and sharing URLs.
+    nextcloud-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+        customResponseHeaders:
+          Strict-Transport-Security: "max-age=15552000; includeSubDomains"
+
+    # ── Redirect www → non-www ───────────────────────────────────────────────
+    # If someone types www.example.com, redirect them to example.com.
+    # This is a common best practice to avoid having your site available on
+    # two different URLs (which confuses search engines and splits cookies).
+    redirect-to-non-www:
+      redirectRegex:
+        regex: "^https://www\\.(.*)"
+        replacement: "https://${1}"
+        permanent: true
+
+    # ── Admin IP Whitelist ───────────────────────────────────────────────────
+    # For extra-sensitive routes (like admin panels), only allow access from
+    # your local network or VPN. Even if someone somehow bypasses Authelia,
+    # they still can't reach these routes from the public internet.
+    #
+    # This is the LAST line of defense — a simple but effective safety net.
+    #
+    # Apply to admin routes:
+    #   - "traefik.http.routers.pihole.middlewares=admin-whitelist@file"
+    #
+    admin-whitelist:
+      ipAllowList:
+        sourceRange:
+          - "192.168.1.0/24"      # Your LAN (home network)
+          - "100.64.0.0/10"       # Tailscale VPN network
+          - "127.0.0.1/32"        # Localhost

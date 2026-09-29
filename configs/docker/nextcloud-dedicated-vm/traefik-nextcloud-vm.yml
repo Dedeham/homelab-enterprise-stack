@@ -1,0 +1,39 @@
+# Copy this file to the Traefik dynamic config directory on the Docker VM:
+#   /opt/docker/traefik/dynamic/nextcloud-vm.yml
+#
+# Replace example.com if needed, then reload Traefik or let the file provider
+# reload it automatically.
+
+http:
+  routers:
+    nextcloud-vm:
+      rule: "Host(`cloud.example.com`)"
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: cloudflare
+      service: nextcloud-vm
+      middlewares:
+        - nextcloud-caldav-vm
+        - nextcloud-hsts-vm
+        - nextcloud-headers@file
+        - rate-limit@file
+
+  services:
+    nextcloud-vm:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.30:8080"
+
+  middlewares:
+    nextcloud-hsts-vm:
+      headers:
+        stsSeconds: 15552000
+        stsIncludeSubdomains: true
+        forceSTSHeader: true
+
+    nextcloud-caldav-vm:
+      redirectRegex:
+        regex: "^https://cloud\\.example\\.com/.well-known/(card|cal)dav"
+        replacement: "https://cloud.example.com/remote.php/dav/"
+        permanent: true

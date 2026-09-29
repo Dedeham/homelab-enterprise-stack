@@ -1,0 +1,116 @@
+# Vaultwarden — Password Manager
+#
+# What is Vaultwarden?
+# ─────────────────────
+# Vaultwarden is a lightweight, self-hosted version of Bitwarden — the popular
+# password manager. You install the official Bitwarden app on your phone/laptop,
+# but instead of syncing to Bitwarden's servers, it syncs to YOUR server.
+#
+# This means:
+#   ✅ All your passwords stay on your hardware — no company has them
+#   ✅ Works with the official Bitwarden apps (browser extension, phone app, desktop)
+#   ✅ Supports 2FA, secure notes, payment card storage, password sharing
+#   ✅ Free — Bitwarden's paid features (TOTP, YubiKey) work for free on Vaultwarden
+#
+# ⚠️  Why is this the MOST IMPORTANT service to set up correctly?
+# Because if Vaultwarden gets breached, an attacker has ALL your passwords.
+# That's why this config has extra security layers:
+#   - Signups are disabled after initial setup (only YOU can have an account)
+#   - It's protected by Authelia (requires 2FA to even reach the login page)
+#   - The admin panel is only accessible from LAN/Tailscale
+#   - The admin token is hashed (not stored in plain text)
+#   - Rate limiting prevents brute-force attacks
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./vaultwarden dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env:         cd /opt/docker/vaultwarden && cp .env.example .env && nano .env
+#   3. Create data dir:     mkdir -p /mnt/main/appdata/vaultwarden
+#   4. Generate admin hash: docker run --rm -it vaultwarden/server /vaultwarden hash
+#   5. Paste the hash into VAULTWARDEN_ADMIN_TOKEN in .env
+#   6. Start:               docker compose up -d
+#   7. Create your account at https://vault.example.com
+#   8. IMMEDIATELY set SIGNUPS_ALLOWED=false in docker-compose.yml and restart
+#
+# BACKUP: Vaultwarden uses SQLite, which is backed up by db-backup.sh before
+# each ZFS snapshot. Your passwords are stored encrypted on the ZFS main pool.
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.31.0
+    container_name: vaultwarden
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true              # Container filesystem is read-only (extra security)
+    tmpfs:
+      - /tmp                     # Vaultwarden needs a writable /tmp for temporary files
+    environment:
+      # Your domain — Vaultwarden needs this to build correct URLs for the apps
+      DOMAIN: https://vault.${DOMAIN}
+
+      # After you create your account, set this to false to lock it down.
+      # Nobody else should be able to create an account on your password manager.
+      SIGNUPS_ALLOWED: "false"
+
+      # Admin panel token (hashed). Access at https://vault.example.com/admin
+      # Generate with: docker run --rm -it vaultwarden/server /vaultwarden hash
+      # Paste the HASH here (starts with $argon2id$ or $argon2i$)
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN_TOKEN}
+
+      # Send email when a new login happens from an unrecognized device.
+      # This is your early warning system — if you get an email you didn't expect,
+      # someone else has your master password.
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: 587
+      SMTP_SECURITY: starttls
+      SMTP_USERNAME: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: vault@${DOMAIN}
+      SMTP_FROM_NAME: Vaultwarden
+
+      # 2FA enforcement — require email verification for new devices
+      REQUIRE_DEVICE_EMAIL: "true"
+
+    volumes:
+      # All vault data — encrypted at rest by ZFS, stored on main pool
+      - /mnt/main/appdata/vaultwarden:/data
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+
+      # Main app route — protected by Authelia 2FA AND rate limiting
+      - "traefik.http.routers.vaultwarden.rule=Host(`vault.${DOMAIN}`)"
+      - "traefik.http.routers.vaultwarden.entrypoints=websecure"
+      - "traefik.http.routers.vaultwarden.tls.certresolver=cloudflare"
+      - "traefik.http.routers.vaultwarden.middlewares=security-headers@file,rate-limit@file,authelia@docker"
+      - "traefik.http.services.vaultwarden.loadbalancer.server.port=80"
+
+      # Admin panel route — ONLY accessible from LAN/Tailscale (IP whitelist)
+      # Even if someone bypasses Authelia somehow, they still can't reach /admin
+      # from the internet. This is the last line of defense.
+      - "traefik.http.routers.vaultwarden-admin.rule=Host(`vault.${DOMAIN}`) && PathPrefix(`/admin`)"
+      - "traefik.http.routers.vaultwarden-admin.entrypoints=websecure"
+      - "traefik.http.routers.vaultwarden-admin.tls.certresolver=cloudflare"
+      - "traefik.http.routers.vaultwarden-admin.middlewares=admin-whitelist@file,security-headers@file"
+      - "traefik.http.routers.vaultwarden-admin.priority=20"   # Higher priority = matched first
+    # Health check — verifies Vaultwarden is actually responding, not just running
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/alive"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+networks:
+  proxy:
+    external: true

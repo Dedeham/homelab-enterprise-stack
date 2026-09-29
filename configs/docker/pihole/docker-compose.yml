@@ -1,0 +1,105 @@
+# Pi-hole — DNS Ad Blocker
+#
+# What is Pi-hole?
+# ─────────────────
+# Pi-hole is a DNS server that runs on your local network. Every device that
+# connects to the internet has to first ask "what is the IP address of google.com?"
+# — that's a DNS lookup. Pi-hole intercepts those lookups and blocks the ones
+# that belong to ad networks, trackers, and malware domains.
+#
+# The result: no ads on any device on your network — phones, smart TVs,
+# game consoles — without installing any extension or app on each device.
+#
+# How it works (step by step):
+#   1. Your router tells every device: "use 192.168.1.20 for DNS" (Docker VM IP)
+#   2. Device asks Pi-hole: "what's the IP of ads.google.com?"
+#   3. Pi-hole checks its blocklist: "ads.google.com is blocked"
+#   4. Pi-hole returns: "0.0.0.0" (nothing) — the ad never loads
+#   5. For non-blocked domains, Pi-hole forwards to Cloudflare/Quad9
+#
+# Pi-hole also gives you:
+#   • Query logs — see every DNS request from every device
+#   • Local DNS records — make "truenas.local" work on your network
+#   • Statistics dashboard — see how many ads were blocked today
+#
+# SECURITY NOTE: DNS port 53 is bound to your SERVER_IP only (not 0.0.0.0).
+# This prevents Pi-hole from being accessible from outside your network.
+# An open DNS resolver on the internet can be abused for DDoS attacks.
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./pihole dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env:         cd /opt/docker/pihole && cp .env.example .env && nano .env
+#   3. Create dirs:         mkdir -p /mnt/main/appdata/pihole/{etc-pihole,etc-dnsmasq}
+#   4. Start:               docker compose up -d
+#   5. Set your router DNS to Docker VM IP (192.168.1.20)
+#   6. Set secondary DNS to 1.1.1.1 (fallback if Docker VM is down)
+#   7. Access admin:        https://dns.example.com/admin
+
+services:
+  pihole:
+    image: pihole/pihole:2025.03.0    # Updated — check hub.docker.com/r/pihole/pihole for latest
+    container_name: pihole
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # DNS — bound to SERVER_IP only (NOT all interfaces)
+      # Every device on your LAN sends DNS queries to port 53.
+      # Binding to a specific IP prevents this from being an open resolver
+      # if the Docker VM has a public-facing interface.
+      - "${SERVER_IP}:53:53/tcp"
+      - "${SERVER_IP}:53:53/udp"
+    environment:
+      TZ: Europe/Amsterdam        # ← Change to your timezone
+      WEBPASSWORD: ${PIHOLE_WEBPASSWORD}
+
+      # Upstream DNS resolvers — when Pi-hole doesn't know the answer
+      # and the domain isn't blocked, it asks THESE servers.
+      # Cloudflare (1.1.1.1) = fast and private
+      # Quad9 (9.9.9.9) = blocks known malware domains
+      PIHOLE_DNS_1: 1.1.1.1
+      PIHOLE_DNS_2: 9.9.9.9
+
+      # Block the most common ads/trackers out of the box
+      BLOCKING_ENABLED: "true"
+
+      # DNSSEC — validates DNS responses haven't been tampered with.
+      # This prevents attackers from redirecting you to fake websites
+      # by spoofing DNS responses ("DNS poisoning"). Cloudflare and
+      # Quad9 both support DNSSEC validation.
+      DNSSEC: "true"
+
+    volumes:
+      # Pi-hole config (blocklists, custom DNS entries, settings)
+      - /mnt/main/appdata/pihole/etc-pihole:/etc/pihole
+      - /mnt/main/appdata/pihole/etc-dnsmasq:/etc/dnsmasq.d
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pihole.rule=Host(`dns.${DOMAIN}`)"
+      - "traefik.http.routers.pihole.entrypoints=websecure"
+      - "traefik.http.routers.pihole.tls.certresolver=cloudflare"
+      # Protect the admin UI — require Authelia + only allow LAN/Tailscale
+      - "traefik.http.routers.pihole.middlewares=admin-whitelist@file,security-headers@file,authelia@docker"
+      - "traefik.http.services.pihole.loadbalancer.server.port=80"
+    healthcheck:
+      test: ["CMD", "dig", "+short", "+norecurse", "+retry=0", "@127.0.0.1", "pi.hole"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,115 @@
+# Jellyfin — Media Server
+#
+# What is Jellyfin?
+# ─────────────────
+# Jellyfin is your personal Netflix. Point it at your movie/TV/music library
+# and it creates a beautiful browsing interface, handles video transcoding
+# (converting video formats so they play on any device), and streams to your
+# phone, TV, browser, or any Jellyfin app — anywhere in the world.
+#
+# It's completely free and open-source (no subscription, no tracking).
+#
+# Key terms for beginners:
+#
+# • Transcoding: Converting a video from one format to another in real time.
+#   Example: your 4K HEVC file gets converted to H.264 so your phone can play it.
+#   Your Xeon E3-1245 v6 has Intel Quick Sync (hardware transcoding) — this
+#   offloads transcoding from the CPU to the GPU, using much less power.
+#
+# • Direct play: The device can play the file as-is, no conversion needed.
+#   Always better than transcoding when possible (less CPU, no quality loss).
+#
+# • Hardware transcoding (Quick Sync):
+#   Your Intel HD Graphics P630 handles transcoding in hardware.
+#   Software transcoding (CPU only):  ~100% CPU usage per stream.
+#   Hardware transcoding (Quick Sync): ~10–15% CPU usage per stream.
+#   This is why we pass through /dev/dri to the container.
+#
+# STORAGE:
+#   Media files → "media" ZFS pool (expendable, no redundancy — re-downloadable)
+#   Metadata    → "main" ZFS pool (protected — posters, thumbnails, user data)
+#
+# WHY NO AUTHELIA?
+#   Jellyfin has its own user account system. If you share it with friends/family,
+#   they create Jellyfin accounts and don't need your Authelia credentials.
+#   Adding Authelia would mean two logins — annoying for a media app.
+#
+# HOW TO DEPLOY:
+#   1. Copy this folder to Docker VM:  scp -r ./jellyfin dockeradmin@192.168.1.20:/opt/docker/
+#   2. Create .env:         cd /opt/docker/jellyfin && cp .env.example .env && nano .env
+#   3. Verify UID/GID:      Run `ls -ln /mnt/media/` and update PUID/PGID in .env to match
+#   4. Create dirs:         mkdir -p /mnt/main/appdata/jellyfin /mnt/media/{movies,tv-shows,music}
+#   5. Start:               docker compose up -d
+#   6. Access:              https://media.example.com
+#   7. Point Jellyfin at your media library during initial setup
+
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:10.9.7
+    container_name: jellyfin
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    user: "${PUID:-1000}:${PGID:-1000}"  # Must match the owner of /mnt/media files
+                                          # Check with: ls -ln /mnt/media/
+                                          # Set PUID/PGID in .env to match
+    group_add:
+      - "video"              # Must be in the video group to use the GPU for transcoding
+      - "render"             # Needed for Intel Quick Sync access on newer kernels
+    environment:
+      TZ: Europe/Amsterdam   # ← Change to your timezone
+      JELLYFIN_DATA_DIR: /config
+      JELLYFIN_CACHE_DIR: /cache
+      JELLYFIN_LOG_DIR: /config/log
+    volumes:
+      # Config and metadata — on ZFS main pool (protected, snapshotted)
+      - /mnt/main/appdata/jellyfin:/config
+
+      # Transcoding cache — Docker volume for speed (wiped on restart, which is fine)
+      - jellyfin_cache:/cache
+
+      # Your media library — on ZFS media pool (expendable, no redundancy needed)
+      # Mounted read-only because Jellyfin doesn't need to write to your media files.
+      # It only reads them to stream/transcode.
+      - /mnt/media/movies:/media/movies:ro
+      - /mnt/media/tv-shows:/media/tv:ro
+      - /mnt/media/music:/media/music:ro
+    devices:
+      # Intel Quick Sync hardware transcoding — pass through the GPU device.
+      # /dev/dri contains your GPU devices. Without this, Jellyfin falls back
+      # to software transcoding (much slower, uses 5-10x more CPU).
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jellyfin.rule=Host(`media.${DOMAIN}`)"
+      - "traefik.http.routers.jellyfin.entrypoints=websecure"
+      - "traefik.http.routers.jellyfin.tls.certresolver=cloudflare"
+      # No Authelia here — Jellyfin has its own user/login system
+      - "traefik.http.routers.jellyfin.middlewares=security-headers@file,rate-limit@file"
+      - "traefik.http.services.jellyfin.loadbalancer.server.port=8096"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 4G         # Transcoding can use significant RAM
+          cpus: '4.0'        # Allow more CPU for transcoding multiple streams
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  jellyfin_cache:
