@@ -2,7 +2,7 @@
 
 Last updated: 2026-06-24
 
-This guide matches the current homelab layout used by the other setup guides:
+This describes the backup strategy for the current homelab layout.
 
 | Component | Value |
 |---|---|
@@ -17,26 +17,13 @@ This guide matches the current homelab layout used by the other setup guides:
 | Backup staging path | `/mnt/main/backups` |
 | Current media path | `/mnt/main/media/data`, mounted on Docker VM as `/mnt/media/data` |
 
-Use this guide after:
-
-1. [Proxmox manual initial setup](../os-and-virtualization/proxmox-manual-initial-setup.md)
-2. [TrueNAS storage pool setup](../os-and-virtualization/truenas-storage-pool-setup.md)
-3. [Ubuntu Docker VM setup](../os-and-virtualization/ubuntu-docker-security-setup.md)
-
 ## The Important Rule
 
 A TrueNAS mirror is not a backup.
 
-The mirror protects against one HDD failing. It does not protect against:
+The mirror protects against one HDD failing. It does not protect against accidental deletion, bad container updates, ransomware or corrupted files, a broken command that overwrites data, theft, fire, water or power damage, or losing the whole server.
 
-- Accidental deletion.
-- Bad container updates.
-- Ransomware or corrupted files.
-- A broken command that overwrites data.
-- Theft, fire, water damage, or power damage.
-- Losing the whole server.
-
-For this repo's current design, use this split:
+For this repo's current design, protection is split as follows:
 
 | Data | Primary protection | Real backup target |
 |---|---|---|
@@ -51,11 +38,9 @@ For this repo's current design, use this split:
 
 Proxmox backups do not replace TrueNAS backups. Because the HDDs are passed through to the TrueNAS VM, Proxmox backs up the VM boot disks, not the ZFS pool data stored on those physical drives.
 
-## What To Back Up In TrueNAS
+## What Is Backed Up In TrueNAS
 
-TrueNAS owns the data disks, so TrueNAS should protect the data.
-
-Back up these datasets first:
+TrueNAS owns the data disks, so TrueNAS protects the data.
 
 | Dataset | Path | Priority | Why |
 |---|---|---:|---|
@@ -65,19 +50,13 @@ Back up these datasets first:
 | `main/userdata` | `/mnt/main/userdata` | Critical if used | Human documents, photos, and shared files |
 | `main/media/data` | `/mnt/main/media/data` | Optional | Media/downloads; usually less critical |
 
-If a service stores state in a Docker named volume on the Docker VM instead of `/mnt/main/appdata`, that data is not protected by TrueNAS snapshots. Either move that service state to a bind mount under `/mnt/main/appdata/SERVICE` or add a separate Docker volume backup job that writes archives into `/mnt/main/backups/docker-volumes`.
+If a service stores state in a Docker named volume on the Docker VM instead of `/mnt/main/appdata`, that data is not protected by TrueNAS snapshots. Such service state should either be moved to a bind mount under `/mnt/main/appdata/SERVICE`, or covered by a separate Docker volume backup job writing archives into `/mnt/main/backups/docker-volumes`.
 
 ## Layer 1: TrueNAS Snapshots
 
-Snapshots are fast local rollback points. They are the first protection for accidental deletion, bad updates, and some ransomware-style damage.
+Snapshots are fast local rollback points — the first protection against accidental deletion, bad updates, and some ransomware-style damage. They are configured through TrueNAS's Periodic Snapshot Tasks.
 
-Create them in TrueNAS:
-
-```text
-Data Protection -> Periodic Snapshot Tasks -> Add
-```
-
-Recommended starting schedule:
+Current schedule:
 
 | Dataset | Recursive | Schedule | Retention |
 |---|---:|---|---|
@@ -87,109 +66,39 @@ Recommended starting schedule:
 | `main/userdata` | Yes | Daily | 30-90 days |
 | `main/media/data` | Optional | Daily or weekly | 7-14 days |
 
-Keep media snapshot retention short unless you intentionally want deleted media to keep using disk space. Large deleted files remain on disk while snapshots still reference them.
+Media snapshot retention is kept short since large deleted files remain on disk while snapshots still reference them.
 
 ### Snapshot Timing For Databases
 
-Filesystem snapshots are useful, but live databases also need logical dumps.
-
-Run database dumps before the snapshot task:
+Filesystem snapshots are useful, but live databases also need logical dumps. Database dumps run before the snapshot task:
 
 | Time | Task |
 |---|---|
-| `01:30` | Run database dump on the Docker VM, or on the dedicated Nextcloud VM if using the isolated deployment |
+| `01:30` | Database dump runs on the Docker VM, or on the dedicated Nextcloud VM if using the isolated deployment |
 | `02:00` | TrueNAS snapshots `main/backups` and `main/appdata` |
 
-For the normal Docker VM deployment, the repo contains the backup script:
+For the standard Docker VM deployment, dumps are produced by `scripts/backup/db-backup.sh`, installed on the Docker VM (not TrueNAS, since it uses `docker exec`) and scheduled via cron. It covers Nextcloud MariaDB and Vaultwarden SQLite — any new database-backed service needs its own dump command added before relying on snapshots alone.
 
-```text
-scripts/backup/db-backup.sh
-```
+For the dedicated Nextcloud VM deployment, `scripts/backup/nextcloud-vm-backup.sh` runs on that VM and writes MariaDB dumps plus the local Nextcloud app/config archive to `/mnt/nc-backups`, which maps to `/mnt/main/backups/nextcloud-db` on TrueNAS.
 
-Install it on the Docker VM, not on TrueNAS, because it uses `docker exec`:
-
-```bash
-sudo mkdir -p /mnt/main/scripts
-sudo cp scripts/backup/db-backup.sh /mnt/main/scripts/db-backup.sh
-sudo chmod 750 /mnt/main/scripts/db-backup.sh
-```
-
-Create the secrets file on the Docker VM:
-
-```bash
-sudo nano /root/.db-backup-secrets
-sudo chmod 600 /root/.db-backup-secrets
-```
-
-Example contents:
-
-```bash
-DB_USER=nextcloud
-DB_PASS=replace_with_the_nextcloud_database_password
-```
-
-Test manually from the Docker VM:
-
-```bash
-sudo bash /mnt/main/scripts/db-backup.sh
-ls -lah /mnt/main/backups/db
-```
-
-Then schedule it with cron on the Docker VM:
-
-```bash
-sudo crontab -e
-```
-
-Add:
-
-```cron
-30 1 * * * /bin/bash /mnt/main/scripts/db-backup.sh
-```
-
-The current script covers Nextcloud MariaDB and Vaultwarden SQLite. Add more dump commands before relying on snapshots for any new database-backed service.
-
-For the dedicated Nextcloud VM deployment, use:
-
-```text
-scripts/backup/nextcloud-vm-backup.sh
-```
-
-That script runs on the Nextcloud VM and writes MariaDB dumps plus the local
-Nextcloud app/config archive to `/mnt/nc-backups`, which maps to
-`/mnt/main/backups/nextcloud-db` on TrueNAS.
+The step-by-step installation and scheduling of these scripts is covered in `docs/setup-and-testing/monitoring-and-updates.md`.
 
 ## Layer 2: TrueNAS Off-Server Backup
 
-Snapshots on the same mirror are not enough. You need at least one copy away from the main pool.
-
-Use one of these targets:
+Snapshots on the same mirror are not enough — at least one copy needs to live away from the main pool.
 
 | Target | Good for | Notes |
 |---|---|---|
-| External USB HDD | Cheapest local backup | Disconnect or rotate it after backup if possible |
+| External USB HDD | Cheapest local backup | Disconnected or rotated after backup where possible |
 | Second TrueNAS box | Best local replication | Uses ZFS replication tasks |
-| Cloud storage | Best off-site option | Use encryption before upload |
-| Remote server | Good if you have another location | Use replication or encrypted `rclone` |
+| Cloud storage | Best off-site option | Encrypted before upload |
+| Remote server | Good if another location is available | Uses replication or encrypted `rclone` |
 
-Recommended first version:
-
-1. Create snapshots for `main/appdata`, `main/backups`, and user data.
-2. Add an external USB drive or cloud target.
-3. Back up only irreplaceable data first: `appdata`, `backups`, user documents, photos, and configs.
-4. Do not spend money backing up replaceable downloads unless you actually care about restoring them.
+The recommended first version of this layer: create snapshots for `main/appdata`, `main/backups`, and user data; add an external USB drive or cloud target; back up only irreplaceable data first (`appdata`, `backups`, user documents, photos, configs); and skip paying to back up replaceable downloads unless restoring them actually matters.
 
 ### Option A: TrueNAS Replication
 
-Use this if the target is another ZFS system or a backup disk formatted for ZFS.
-
-In TrueNAS:
-
-```text
-Data Protection -> Replication Tasks -> Add
-```
-
-Replicate:
+Used when the target is another ZFS system or a backup disk formatted for ZFS, via TrueNAS Replication Tasks. Replicated datasets:
 
 ```text
 main/appdata
@@ -198,19 +107,11 @@ main/nextcloud
 main/userdata
 ```
 
-Do not replicate `main/media/data` by default unless you want the storage cost.
+`main/media/data` is not replicated by default unless the storage cost is acceptable.
 
 ### Option B: TrueNAS Cloud Sync
 
-Use this for cloud backup.
-
-In TrueNAS:
-
-```text
-Data Protection -> Cloud Sync Tasks -> Add
-```
-
-Recommended settings:
+Used for cloud backup, via TrueNAS Cloud Sync Tasks.
 
 | Setting | Value |
 |---|---|
@@ -221,13 +122,13 @@ Recommended settings:
 | Include | `appdata`, `backups`, `nextcloud`, `userdata` |
 | Exclude | Large replaceable media and downloads |
 
-Use a provider and retention model you understand. A sync task can propagate deletions depending on mode, so snapshots still matter.
+A sync task can propagate deletions depending on mode, so snapshots still matter as an independent safety net.
 
 ## Layer 3: Proxmox Backups
 
-Proxmox should back up the VM boot disks and VM definitions. It should not be treated as the backup for TrueNAS pool data.
+Proxmox backs up the VM boot disks and VM definitions. It is not the backup for TrueNAS pool data.
 
-Back up these VMs:
+VMs covered by Proxmox backup:
 
 | VM | Back up in Proxmox? | Include |
 |---|---:|---|
@@ -236,24 +137,16 @@ Back up these VMs:
 | Dedicated Nextcloud VM | Yes if deployed | VM boot disk and `/opt/docker/nextcloud` local app/config state |
 | Hermes VM | Yes if used | VM boot disk and config |
 
-For the TrueNAS VM:
+For the TrueNAS VM, the passed-through HDDs are not the data Proxmox backs up — the important TrueNAS data backup happens through snapshots, replication, cloud sync, or external disk backup. The TrueNAS config is still exported after major changes.
 
-- The passed-through HDDs are not the data you want Proxmox to back up.
-- The important TrueNAS data backup happens through snapshots, replication, cloud sync, or external disk backup.
-- Still export the TrueNAS config after major changes.
-
-For the Docker VM:
-
-- A Proxmox backup helps rebuild the container host quickly.
-- It does not replace TrueNAS snapshots for `/mnt/main/appdata`.
-- If any containers use local Docker named volumes, back those up separately or move them to `/mnt/main/appdata`.
+For the Docker VM, a Proxmox backup helps rebuild the container host quickly, but it does not replace TrueNAS snapshots for `/mnt/main/appdata`. Containers using local Docker named volumes need separate backup, or should be moved to `/mnt/main/appdata`.
 
 Recommended Proxmox targets:
 
 | Target | Use it? | Notes |
 |---|---:|---|
 | Proxmox Backup Server | Best | Deduplicated, scheduled, verified backups |
-| External USB disk attached to Proxmox | Good starter option | Keep at least one copy away from the server |
+| External USB disk attached to Proxmox | Good starter option | At least one copy kept away from the server |
 | TrueNAS NFS share from the same TrueNAS VM | Avoid for core recovery | Circular dependency if TrueNAS is down |
 | Same Proxmox boot SSD only | Not enough | Useful only for temporary convenience |
 
@@ -265,52 +158,29 @@ Basic schedule:
 | TrueNAS VM boot disk | Weekly or after config changes | 4-8 copies |
 | Proxmox `/etc/pve` config export | After major changes | Keep latest off-server |
 
-Manual Proxmox config export:
-
-```bash
-tar czf /root/proxmox-config-$(date +%F).tar.gz /etc/pve
-```
-
-Copy that archive off the Proxmox host. Do not leave the only copy on the same boot disk.
-
 ## TrueNAS Config Backup
 
-After creating pools, shares, users, snapshot tasks, replication tasks, or cloud sync tasks, export the TrueNAS config.
+After creating pools, shares, users, snapshot tasks, replication tasks, or cloud sync tasks, the TrueNAS config is exported (System Settings → General → Manage Configuration → Download File) and stored in at least two places: a password manager or encrypted archive, and an off-server backup location. Relying only on the TrueNAS boot disk is avoided — if it dies, a config export makes recovery much faster.
 
-In TrueNAS:
+## Appdata Backup State
 
-```text
-System Settings -> General -> Manage Configuration -> Download File
-```
+The baseline this strategy targets:
 
-Store the config file in at least two places:
+- `/mnt/main/appdata` is a TrueNAS dataset.
+- The Docker VM mounts `/mnt/main` from `192.168.1.10:/mnt/main`.
+- Services use bind mounts under `/mnt/main/appdata/SERVICE`.
+- Any remaining Docker named volumes are documented.
+- `scripts/backup/db-backup.sh` runs successfully on the Docker VM if Docker-VM Nextcloud or Vaultwarden are deployed.
+- `scripts/backup/nextcloud-vm-backup.sh` runs successfully on the dedicated Nextcloud VM if that deployment path is used.
+- Database dumps appear under `/mnt/main/backups/db`, or under `/mnt/main/backups/nextcloud-db` for the dedicated Nextcloud VM.
+- TrueNAS snapshots include `main/appdata` and `main/backups`.
+- A copy of critical datasets exists outside the main server.
+- TrueNAS config has been exported.
+- Proxmox VM backups are scheduled to a non-circular target.
 
-- Password manager or encrypted archive.
-- Off-server backup location.
+## Restore Testing
 
-Do not rely only on the TrueNAS boot disk. If the TrueNAS VM boot disk dies, a config export makes recovery much faster.
-
-## Appdata Backup Checklist
-
-Before treating the homelab as production, confirm:
-
-- [ ] `/mnt/main/appdata` is a TrueNAS dataset.
-- [ ] The Docker VM mounts `/mnt/main` from `192.168.1.10:/mnt/main`.
-- [ ] Services use bind mounts under `/mnt/main/appdata/SERVICE`.
-- [ ] Any remaining Docker named volumes are documented.
-- [ ] `scripts/backup/db-backup.sh` runs successfully on the Docker VM if Docker-VM Nextcloud or Vaultwarden are deployed.
-- [ ] `scripts/backup/nextcloud-vm-backup.sh` runs successfully on the dedicated Nextcloud VM if that deployment path is used.
-- [ ] Database dumps appear under `/mnt/main/backups/db`, or under `/mnt/main/backups/nextcloud-db` for the dedicated Nextcloud VM.
-- [ ] TrueNAS snapshots include `main/appdata` and `main/backups`.
-- [ ] A copy of critical datasets exists outside the main server.
-- [ ] TrueNAS config has been exported.
-- [ ] Proxmox VM backups are scheduled to a non-circular target.
-
-## Restore Tests
-
-A backup is not proven until a restore works.
-
-Run these tests quarterly:
+A backup is not proven until a restore works. Restore tests are run quarterly:
 
 | Test | Where | Success condition |
 |---|---|---|
@@ -318,25 +188,6 @@ Run these tests quarterly:
 | Restore one database dump to a test database | Docker VM | App can read the restored database |
 | Restore one file from off-server backup | Backup target | Downloaded/restored file matches original |
 | Restore Docker VM backup | Proxmox test VM or maintenance window | VM boots and mounts TrueNAS |
-| Import TrueNAS config | Maintenance test or documented dry run | You know where the config file is |
+| Import TrueNAS config | Maintenance test or documented dry run | Config file location is known |
 
-Quick snapshot restore pattern from the Docker VM:
-
-```bash
-ls /mnt/main/.zfs/snapshot
-```
-
-If the `.zfs` directory is not visible, enable snapshot directory visibility in TrueNAS for the dataset or restore through the TrueNAS UI.
-
-## Minimum Setup To Do Now
-
-If you only do the essentials, do these in order:
-
-1. Create TrueNAS snapshot tasks for `main/appdata` and `main/backups`.
-2. Run database dumps into `/mnt/main/backups/db` for database-backed containers.
-3. Export the TrueNAS config file.
-4. Configure Proxmox backups for the TrueNAS VM boot disk and Ubuntu Docker VM.
-5. Add one off-server backup target for `appdata`, `backups`, and user data.
-6. Restore one test file from snapshot and one file from the off-server backup.
-
-That gives you the practical baseline: Proxmox can restore machines, TrueNAS can restore data, and `appdata` is protected beyond the mirror.
+The step-by-step restore procedures and the minimum initial setup checklist are in `docs/setup-and-testing/monitoring-and-updates.md`.

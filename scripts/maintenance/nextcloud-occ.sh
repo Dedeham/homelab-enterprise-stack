@@ -1,54 +1,30 @@
 #!/bin/bash
-# =============================================================================
-# Nextcloud Maintenance — occ Command Wrapper
-# =============================================================================
+# Wrapper for Nextcloud's occ CLI, which has to run inside the Docker
+# container rather than directly on the host.
 #
-# What is "occ"?
-# ──────────────
-# "occ" (ownCloud Console) is Nextcloud's built-in command-line tool.
-# It lets you do things that aren't possible through the web UI, like:
-# - Triggering a file system scan (after you add files directly to the server)
-# - Enabling/disabling maintenance mode (required before updates)
-# - Managing users from the terminal
-# - Fixing common issues
-#
-# Why do you need this wrapper?
-# Because Nextcloud runs INSIDE a Docker container, you can't just type "occ"
-# in your terminal — you have to tell Docker to run it inside the container.
-# This script does that for you so you don't have to remember the full command.
-#
-# The full raw command (what this script saves you from typing):
-#   docker exec --user www-data nextcloud php occ <command>
-#
-# HOW TO USE:
+# Usage:
 #   bash nextcloud-occ.sh <occ-command>
 #   bash nextcloud-occ.sh status
 #   bash nextcloud-occ.sh files:scan --all
 #   bash nextcloud-occ.sh maintenance:mode --on
-#
-# =============================================================================
 
 set -euo pipefail
 
 CONTAINER_NAME="nextcloud"
 
-# Check that the container is running
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    echo "❌ ERROR: Container '${CONTAINER_NAME}' is not running."
+    echo "ERROR: Container '${CONTAINER_NAME}' is not running."
     echo "   Start it with: docker compose up -d"
     exit 1
 fi
 
-# If no arguments given, show a help menu
 if [[ $# -eq 0 ]]; then
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║            Nextcloud occ — Quick Reference                  ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo "Nextcloud occ - Quick Reference"
     echo ""
     echo "Usage: bash nextcloud-occ.sh <command>"
     echo ""
-    echo "── COMMON COMMANDS ──────────────────────────────────────────────"
+    echo "COMMON COMMANDS"
     echo ""
     echo "  STATUS & INFO"
     echo "    status                     Show Nextcloud version and status"
@@ -81,7 +57,7 @@ if [[ $# -eq 0 ]]; then
     echo "  BACKGROUND JOBS"
     echo "    background:cron            Switch cron mode (should be 'cron')"
     echo ""
-    echo "── EXAMPLE UPDATE WORKFLOW ──────────────────────────────────────"
+    echo "EXAMPLE UPDATE WORKFLOW"
     echo ""
     echo "  1. bash nextcloud-occ.sh maintenance:mode --on"
     echo "  2. docker compose pull nextcloud        (download new image)"

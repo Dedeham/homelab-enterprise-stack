@@ -1,15 +1,10 @@
 #!/bin/bash
-# =============================================================================
-# Dedicated Nextcloud VM Backup
-# =============================================================================
+# Run on the dedicated Nextcloud VM after /mnt/nc-backups is mounted from
+# TrueNAS. Creates a logical MariaDB dump and a tar archive of the local
+# Nextcloud app/config directory (excluding user data).
 #
-# Run this on the dedicated Nextcloud VM after /mnt/nc-backups is mounted from
-# TrueNAS. It creates:
-# - a logical MariaDB dump
-# - a tar archive of the local Nextcloud app/config directory, excluding user data
-#
-# User files are protected separately by TrueNAS snapshots and off-site backup of
-# the main/nextcloud dataset.
+# User files are protected separately by TrueNAS snapshots and off-site
+# backup of the main/nextcloud dataset.
 
 set -euo pipefail
 umask 077
